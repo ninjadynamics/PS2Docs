@@ -244,6 +244,19 @@ audio stack proved the danger: `ps2snd.irx` worked over ps2link, but in
 standalone boot its `BINDID_PS2SND` RPC never came up until the IOP reset and
 SBV patches were added.
 
+Make the reset build-conditional so it does not cost you the dev loop.
+`SifIopReset` reboots the whole IOP, and under network boot ps2link's ethernet
+driver (SMAP) lives there — so the reset kills ps2link's network. The EE program
+keeps running, but `ps2client reset` / `printf` die and you must physically
+power-cycle to reload ps2link before the next deploy (telltale: `ping` answers
+right after a hard reset, then goes unreachable the instant the ELF runs). The
+reset is only needed standalone — under ps2link the IOP is already primed for
+buffer-loaded IRX — so guard it with a build flag: `#ifndef PS2_PS2LINK` around
+the reset / sync / re-init, defined only for the `ps2client` deploy goal, keeping
+`SifInitRpc(0)` and the SBV patches on both paths. The standalone build stays
+self-contained; the network-boot dev build keeps ps2link alive so reset/printf
+survive and iteration needs no power-cycle.
+
 When debugging standalone or PCSX2 boot hangs, `printf` is gone. ps2sdk
 `printf` routes to ps2link, and PCSX2's trace log has hardware trace categories,
 not a program-console stream. Use GS color breadcrumbs:
@@ -608,6 +621,21 @@ calling the backend; the stack can corrupt and surface as an instruction-fetch
 TLB exception. The water splash tooth emitter is the canonical pattern:
 begin sets state and resets a cached mesh, add appends each tooth, end clips and
 draws once.
+
+Flat per-vertex color needs a faked flat light. ps2gl has no unlit
+per-vertex-color renderer — every `PerVtxMaterial:kDiffuse` microprogram also
+requires `Lighting:1`, and per-vertex color is only transferred to VU1 when
+`GL_COLOR_MATERIAL` is enabled. With color-material off you silently get the last
+`glColor` for the whole batch; with it on but lighting off the lookup finds no
+renderer and faults. To render flat per-face colors (a procedural city of
+per-color building faces) without real shading, give every vertex the same
+constant normal and a single directional light pointing along that same eye-space
+normal, so `N·L ≡ 1` everywhere and the diffuse term passes the vertex color
+straight through unshaded. Use `glColorMaterial(GL_FRONT_AND_BACK, GL_DIFFUSE)`
+(only `GL_DIFFUSE` varies per vertex on ps2gl), zero ambient and specular, and
+configure the light under an identity modelview so its direction matches the
+emitted normal. The color must also survive the EE clipper, so the clip vertex
+carries RGBA and interpolates it across cuts.
 
 ## Chapter 10 - Texture Formats, Alpha, and Filtering
 
