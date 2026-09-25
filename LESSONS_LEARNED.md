@@ -5,6 +5,13 @@ by Ninja Dynamics
 
 Public Release Edition, June 2026
 
+Technical updates through September 25, 2026.
+
+This handbook teaches PS2 programming contracts: address spaces, DMA ownership,
+GS state and precision, IOP services, and validation on real hardware. Project
+milestones, asset policies, and selected runtime defaults belong in project
+documentation, not in the rules of this book.
+
 This handbook is distilled from HyperSolar's PS2 work. It is written
 for the person who already has the SDK, already has the manuals, and is now
 staring at a black screen, a silent SPU2, a wrong-colored CLUT, or a render path
@@ -27,9 +34,8 @@ dependencies the reader must have.
 Most of what is hard about the PS2 is not in any one manual. The Sony manuals
 are excellent first-principles references — they tell you exactly what every GS
 register does and exactly how an SPU2 voice is structured. What they cannot tell
-you is which of those facts will quietly ruin your week: that a 16-bit color
-buffer paired with a 24-bit Z buffer renders perfectly in an emulator and
-corrupts on hardware; that `pglFinish()` destroys your GL context instead of
+you is which of those facts will quietly ruin your week: that an incorrectly reserved color/Z layout can render correctly in an
+emulator and corrupt on hardware; that `pglFinish()` destroys your GL context instead of
 flushing it; that a buffer-loaded IRX can report success and never register its
 RPC server. Those are emergent properties of the *combination* — EE plus GS plus
 IOP plus SPU2 plus a forked OpenGL-ish library plus an emulator plus a network
@@ -44,9 +50,9 @@ is stated plainly, and where a fix is empirical-but-unproven it says so.
 Each chapter is self-contained and built around the same spine: a rule you can
 apply, the failure mode that makes you reach for it, and a pointer to the Sony
 manual chapter that explains the underlying hardware. Read straight through for
-a tour of the whole port, or jump to the chapter that matches your current black
+a tour of the platform and its software stack, or jump to the chapter that matches your current black
 screen. Chapter 1 is the mental model everything else assumes; Appendix A is the
-whole book compressed to a checklist; Appendix B is the port told as a timeline.
+whole book compressed to a checklist; Appendix B collects the historical context of the worked examples.
 
 ### Conventions
 
@@ -105,9 +111,9 @@ The PS2 is several machines tied together by DMA and RPC-like boundaries. Treat
 those boundaries as real architectural seams.
 
 The EE runs the game, simulation, asset orchestration, and most rendering glue.
-The VUs and ps2gl handle transform/render submission for supported paths, but
-the case-study renderer also uses an EE CPU software clipper for geometry that
-ps2gl cannot safely clip. The GS is not a modern forgiving GPU; it is a
+The VUs can handle transform and render submission; libraries such as ps2gl
+provide supported paths. An EE software clipper remains useful for geometry
+that a chosen VU renderer cannot safely clip. The GS is not a modern forgiving GPU; it is a
 rasterizer with strict VRAM page geometry, fixed-point coordinate limits,
 explicit texture registers, and very sticky state.
 
@@ -140,10 +146,9 @@ code." It earns its place because every PS2-specific bug is cheaper to fix when
 the platform code is a thin, parameter-fed library than when it has quietly grown
 into a second copy of the game with its own drifting scene order.
 
-The PS2 backend should be a library, not a parallel game. In the case-study
-codebase that backend is named `playstation2.c`; in another project it may have
-another name. The important shape is a hardware/service layer that shared game
-and render code call into.
+Keep hardware and service mechanisms separate from application policy. A PS2
+backend can expose rendering and I/O primitives while shared application code
+supplies resources, transforms, ordering and gameplay-derived parameters.
 
 It may own:
 
@@ -153,15 +158,14 @@ It may own:
 - alpha conversion and blend-state helpers;
 - the software clipper;
 - display-list compile/call helpers;
-- PS2 draw primitives such as skybox, floor, haze, particles, reticles, sun,
-  speedlines, and lens flare;
+- PS2 draw primitives with explicit input, state and lifetime contracts;
 - scene resource installers that turn already-loaded assets into PS2 helper
   meshes, display lists, or baked textures;
 - memory-card blob I/O and low-level PS2 service code.
 
 It should not:
 
-- read `game.*`, except for the explicit pad-write adapter pattern;
+- read application globals; the pad adapter returns input through an explicit interface;
 - name game asset files directly;
 - compose scenes;
 - own stage sequencing, gameplay state transitions, timers, scoring, or sim
@@ -177,17 +181,15 @@ code drifted in draw order. That drift was not cosmetic: haze drew after
 particles and made explosions look behind fog. Keep new scene elements in the
 shared scene function and put PS2-specific behavior at leaf helpers.
 
-When porting a cross-platform render function, grep the original for
-`game.stage->` and `game.*` reads. Each read is either a parameter the PS2
-dispatch must forward or a sign that the helper boundary is wrong. The lava
-stage exposed this: a PS2 floor helper hardcoded the water floor composition and
-the lava stage became double-layered and transparent.
+When porting a render function, identify every read of application state and
+make it an explicit input or keep it in shared scene code. Hardcoding one
+material composition into a platform helper can silently change another scene.
 
-Stage-shaped resources are now real per-stage resources on PS2. Skyboxes and
-floors load from the stage table, call the CSV texture pipeline, and install the
-PS2 form. Only the active scene's GS resources should be resident. Mipped floors
-need a deep unload because their locked mip levels and global MIPTBP ownership
-outlive a plain texture unload.
+Resource lifetime should follow the resource's actual use. Load and install
+scene-dependent textures through the application resource manager; release
+their PS2 representations when no remaining consumer needs them. Mipped
+textures need teardown for all hidden levels and any shared allocation owner,
+not just their public base handle.
 
 The backend API has two classes of calls:
 
@@ -196,9 +198,9 @@ The backend API has two classes of calls:
 - hot-loop `*_add()` or `*_draw()` calls between begin/end should be lean and
   inherit state from the matching begin.
 
-The F22 inside-out bug is the warning label. Reticles restored generic raylib
-state that re-enabled culling. If `ps2_render_player()` trusts prior state, the
-reversed GLB winding gets culled from the visible side.
+For example, an overlay helper that restores generic state may re-enable
+culling. A subsequent mesh draw must establish the winding and cull convention
+it needs, even if that convention differs from the preceding mesh.
 
 ## Chapter 3 - Boot, IOP Bring-Up, and Standalone Reality
 
@@ -219,7 +221,8 @@ register its RPC server if the IOP is in the wrong inherited state. ps2link
 masks this because its loader leaves the IOP usable; PCSX2 and real disc/USB
 standalone boots do not.
 
-The reliable sequence is:
+For a standalone application that owns IOP initialization, the case-study
+sequence is:
 
 ```c
 SifInitRpc(0);
@@ -250,9 +253,9 @@ driver (SMAP) lives there — so the reset kills ps2link's network. The EE progr
 keeps running, but `ps2client reset` / `printf` die and you must physically
 power-cycle to reload ps2link before the next deploy (telltale: `ping` answers
 right after a hard reset, then goes unreachable the instant the ELF runs). The
-reset is only needed standalone — under ps2link the IOP is already primed for
-buffer-loaded IRX — so guard it with a build flag: `#ifndef PS2_PS2LINK` around
-the reset / sync / re-init, defined only for the `ps2client` deploy goal, keeping
+network-loader build can deliberately retain the loader
+environment if it provides the required services. Use an explicit boot-mode
+flag around reset / sync / re-init, keeping
 `SifInitRpc(0)` and the SBV patches on both paths. The standalone build stays
 self-contained; the network-boot dev build keeps ps2link alive so reset/printf
 survive and iteration needs no power-cycle.
@@ -265,7 +268,7 @@ not a program-console stream. Use GS color breadcrumbs:
 BeginDrawing();
 ClearBackground(SOME_COLOR);
 EndDrawing();
-ps2_frame_end();
+/* Complete presentation through the renderer's normal frame boundary. */
 ```
 
 The screen freezes on the last completed color. PCSX2 logs can still distinguish
@@ -278,9 +281,11 @@ failure path can run to completion, a `100000 * nopdelay()` wait is effectively
 a hang. Use small bounded counts.
 
 `sceSifBindRpc(cd, sid, 0)` blocks until the IOP replies. An unregistered server
-does not reply. For probes, use `SIF_RPC_M_NOWAIT`, poll `cd->server`, and
-re-send the bind occasionally because an unregistered SID can be silently
-dropped before the server appears.
+does not reply. For probes, use `SIF_RPC_M_NOWAIT` with persistent client storage. Before
+retrying, prove the previous bind idle with `sceSifCheckStatRpc`. A timeout
+reports failed progress but does not release RPC/DMA ownership. An unregistered
+SID may be dropped before the server appears; retry within a bounded deadline
+only after the previous transaction has completed.
 
 ## Chapter 4 - Toolchain and Build-System Traps
 
@@ -329,9 +334,8 @@ addresses; GS User's Manual Supplement for errata.
 This is the chapter where the emulator lies most. The GS display path — sync
 timing, the DISPLAY register's magnification, framebuffer page alignment, the
 color/Z pairing, BGCOLOR — is largely normalized away by PCSX2 and only tells
-the truth on a real console with a real TV. Treat every rule here as
-hardware-validated, because each one was caught only after PCSX2 said it was
-fine.
+the truth on a real console with a real TV. Validate display changes on the target console and output device; emulator
+success alone does not establish that those registers describe a valid raster.
 
 Do not call libgraph's `graph_set_mode` or `graph_set_screen` on top of ps2gl.
 libgraph and ps2gl both program the GS display read-circuit registers. Calling
@@ -344,11 +348,11 @@ GS `DISPLAY` register's position, magnification, and size. ps2gl re-sends its
 display environment each frame, so a mode switch must update ps2gl's live
 display environment too.
 
-Use the corrected ps2sdk constant: `GS_MODE_DTV_480P == 0x50`. An older lesson
-recorded `0x32`; that is superseded by the later PS2 video-mode work.
+The ps2sdk constant `GS_MODE_DTV_480P` is `0x50`; do not substitute the
+incorrect value `0x32`.
 
-The case-study progressive layout is 640x448p, not 480p. The reasons are pure
-GS layout math:
+Choose visible dimensions separately from the output timing mode. For example,
+a 640x448 image within progressive output can reuse a 448-line allocation:
 
 - 448 is exactly 7 rows of 64-line 16-bit GS pages.
 - 480 is 7.5 rows and needs padding to 512 lines in memory.
@@ -361,15 +365,17 @@ formats and 64x64 for 16-bit formats. Do not size framebuffers by
 640x480 buffer, 480 lines address into 7.5 page rows; the bottom-right portion
 spills into the next buffer unless the reservation is rounded to 512 lines.
 
-Color and Z formats must share page geometry. Pair 16-bit color with 16-bit Z,
-and pair 32-bit color with 24-bit Z. A 16-bit color buffer with 24-bit Z may look
-fine in PCSX2 but corrupts on real GS hardware because color and Z pages advance
-on different row heights.
+Do not reuse a color-buffer reservation calculation blindly for Z. The
+case-study layouts paired 16-bit color with 16-bit Z and 32-bit color with
+24-bit Z; a mixed 16-bit-color/24-bit-Z setup corrupted on hardware despite
+appearing correct in PCSX2. That observation does not establish a universal
+ban on mixed formats. Check each PSM's page geometry, base, stride and reserved
+range against the GS manual, then validate the complete layout on hardware.
 
 The cost of 16-bit Z is coarser depth. Thin double-sided geometry can z-fight.
-Fix that with culling, not by switching to 24-bit Z. The case-study F22 GLB has
-reversed winding relative to ps2gl's `GL_BACK` convention, so the player model
-needs `glCullFace(GL_FRONT)`.
+Where only the exterior is intended to be visible, correct culling can remove
+the competing back surface. Verify each asset's winding against the renderer's
+front-face convention rather than prescribing one cull face for every model.
 
 For DTV progressive, `DISPLAY.magH` must match the faster scan clock. Interlaced
 NTSC/PAL used `magH = 4`; DTV progressive needs `magH = 2`. Leaving the old value
@@ -379,7 +385,9 @@ validate display-register work on a real console.
 Runtime GS layout switching is possible, but the safe ritual matters:
 
 - `pglFinish()` is not a flush; it destroys the GL context. Drain with
-  `pglWaitForVU1()` and `pglWaitForVSync()`.
+  `pglFinishRenderingGeometry(PGL_DONT_FORCE_IMMEDIATE_STOP)` and
+  `pglWaitForPresentation()` before `pglWaitForVU1()` and `pglWaitForVSync()`.
+  Retire queued geometry/presentation before destroying the slot map.
 - Remove and rebuild GS memory slots, including locked framebuffer slots.
 - Re-add framebuffer and Z slots, bind areas, set draw buffers, call `SetGsCrt`,
   set display buffers, then set the ps2gl video mode.
@@ -391,10 +399,11 @@ Runtime GS layout switching is possible, but the safe ritual matters:
 
 The GS `BGCOLOR` register controls the margins outside the active framebuffer.
 ClearBackground does not touch it. Soft reset does not reliably clear it. Write
-it as a 64-bit store to physical `0x120000E0`, not a kseg1 alias. Re-zero it
-after `EndDrawing()` and after video-mode application. Also re-zero it before
-known long mid-frame stalls such as scene loads; otherwise a previously stomped
-color can show in the side bars for the duration of the stall.
+it as a 64-bit store to physical `0x120000E0`, not a kseg1 alias. Have the display owner maintain the intended margin color across frame and
+mode transitions. In a stack that overwrites it, restore it at the documented
+housekeeping boundary and before long stalls; otherwise the unwanted color can
+remain visible in the margins. This is a display-state workaround, not a
+replacement for finding an unexpected register writer.
 
 The interlace flicker filter is the two-read-circuit merge, not a post pass and
 not `SMODE2.FFMD`. The GS has two display read circuits (`PMODE.EN1`/`EN2`).
@@ -437,12 +446,13 @@ re-anchor), which are easy to conflate and painful to debug once you have.
 
 The 640x448 PS2 framebuffer is not geometrically neutral on a 4:3 display. The
 display stretches 448 lines to the TV raster height, making the scene vertically
-stretched relative to DC and PC. A 640x448 renderer can correct this by applying
+stretched relative to square-pixel rendering. A 640x448 renderer can correct this by applying
 a centered horizontal scale:
 
 ```c
-xscale = (float)NATIVE_H / (float)SCREEN_H; /* 480 / 448 */
-if (ps2_wide_squeeze) xscale *= PS2_WIDE_SQUEEZE_X;
+/* Example: preserving a 640x480 square-pixel reference in 640x448. */
+xscale = 480.0f / 448.0f;
+if (widescreen) xscale *= 3.0f / 4.0f; /* 4:3 content on a 16:9 raster */
 ```
 
 This baseline 4:3 correction and the 16:9 anamorphic squeeze use the same
@@ -452,15 +462,14 @@ passes use the same scale.
 
 Aspect correction and placement are separate jobs. The pass scale corrects
 geometry; HUD layout must re-anchor edge positions with the inverse scale
-(`hud_ar_x()` in the game). Centered elements need no horizontal correction.
+(the inverse of the centered pass transform). Centered elements need no horizontal correction.
 
-Any pass that replaces matrices inherits both jobs. Attract overlay passes load
-their own projection/view, so they must re-apply the squeeze and re-anchor
+Any pass that replaces matrices inherits both jobs. Overlay passes that load
+their own projection/view must re-apply the squeeze and re-anchor
 edge-based screen coordinates before adding half-size offsets.
 
 "Full-screen" fills are not simply `(0,0,SCREEN_W,SCREEN_H)` inside the PS2 2D
-aspect pass. Horizontally, use the inverse AR span from `hud_ar_x(0)` to
-`hud_ar_x(SCREEN_W)`. Vertically, overscan past `SCREEN_H` because the GS fill
+aspect pass. Horizontally, use the inverse aspect transform of both screen edges. Vertically, overscan past `SCREEN_H` because the GS fill
 rule can drop the exact boundary row. Let the GS scissor clip the extra pixels.
 The same horizontal span rule applies to tiled texture backdrops.
 
@@ -493,22 +502,22 @@ The text path proved it in stages:
 General rule: hot paths should use `begin/add/end`, hoist state into `begin`,
 and vary only uniform color or data inside.
 
-Keep one uniform color per `rlBegin`/`rlEnd` batch. ps2gl has no reliable unlit
-varying-color renderer. Mixed colors inside one batch can fault, hang, or route
-into an unsupported renderer. `rlEnd` alone does not necessarily flush; adjacent
-same-mode/same-texture batches can merge. If colors vary per primitive, either
-flush each primitive or bucket by quantized RGBA and emit one uniform-color batch
-per bucket.
+Stock fixed-function immediate paths have restricted unlit varying-color
+support. Uniform-color batches or the established flat-light helper remain
+appropriate there. The fork also has an explicitly admitted unlit colored
+triangle renderer used by prepared HUD and particle paths; its finite state
+and attribute contract does not qualify arbitrary stock batches.
 
-This applies to 2D and 3D. Speedlines bucket by alpha. Particles bucket by
-quantized RGBA. Lens flare ghosts have few distinct colors, so one flush per
-ghost is already fine.
+An ordered particle path can stage colored arrays while retaining bucket order
+and replay an equivalent fallback when a batch does not meet the fast path's
+contract. `rlEnd` alone need not construct pending geometry: flush while its
+bindings and admission flags are still valid.
 
-Do not call raylib or timer APIs immediately after `EndDrawing()` on PS2. The
-raylib4ps2 `EndDrawing()` path flushes and swaps, and the main loop expects GS
-housekeeping immediately afterward. A `GetTime()` call in that narrow slot
-faulted. Measure logic and render before `EndDrawing()`, then derive swap from
-frame time if needed.
+The frame owner controls `EndDrawing`, queued presentation and scratch reuse.
+A historical post-`EndDrawing` timer fault motivated a narrow housekeeping
+boundary in one integration; it is not a universal prohibition on time reads.
+Define the boundary explicitly, and include reporting and swap work in total
+frame cost.
 
 Avoid `%f` formatting on PS2's libc in per-frame HUD/debug strings; it has
 crashed. Use integer fixed-point formatting such as `%d.%02d`.
@@ -517,10 +526,6 @@ Chained translucent passes should share one state block. If water splash and
 engine jets both want lighting off, depth writes off, alpha blend on,
 `PGL_CLIPPING` off, and edge AA off, the caller should set that state once,
 call both helpers, and restore once.
-
-Public PS2 draw primitives should fence their own state. Internal add calls
-between begin/end can assume the begin state, but public entry points must not
-depend on what the previous pass happened to leave behind.
 
 ## Chapter 8 - Depth, Blending, and 2D Primitives
 
@@ -541,13 +546,82 @@ instead: enable depth test, set `glDepthFunc(GL_ALWAYS)`, disable depth writes,
 draw, then restore `GL_LEQUAL`. On the GS, "disabled" depth is effectively an
 always-pass mode anyway.
 
+Coplanar overlays need a different explicit contract. Put every layer that is
+physically one surface at the same coordinate, draw the base first, then draw the
+overlay with `GL_LEQUAL` and depth writes disabled. LEQUAL is intentional: equal
+depth means “this is the authored overlay,” while earlier opaque scene geometry
+still occludes it. Use strict LESS only when an equal-depth fragment is supposed
+to preserve the earlier surface. Do not manufacture painter order with Y nudges;
+at a wall or mask boundary those offsets become visible silhouettes.
+
+### Coplanar does not mean equal raster depth
+
+The tie rule above requires equal **rasterized** depth. Replaying identical
+transformed triangles satisfies a stronger contract than drawing a shorter
+sticker on a full-height facade. Different vertices, clipping intersections
+and diagonals can produce different GS depth planes after quantization, even
+when their original world plane and matrices agree. LEQUAL accepts a tie; it
+does not repair a fragment that rounded behind its host.
+
+The GS stores XY at 1/16-pixel precision and XYZF2 Z as an integer. The common
+VU `FTOI4.xyz` instruction does not add four fractional bits to stored Z: GIF
+packed XYZF2 extraction discards those low four Z bits. Use the live raster
+scale and depth format when calculating a tolerance. A 224-row field and a
+448-row progressive buffer do not have the same pixel-space slope.
+
+This distinction explained persistent entrance/facade fighting in the
+independent-decal case study. Matching the raw X2 transforms helped but did not
+eliminate it. Disabling the additive material did not fix it. Reducing tiled U
+magnitude addressed texture precision but left the depth artifact. The
+0.5% reciprocal-depth pull that worked on another platform was below one Z16 unit beyond
+about 16.4 eye-space units with projection near 0.05. Earlier slope bins also
+gave near-crossing quads zero bias and capped the result at 128 units.
+
+The hardware-confirmed repair uses a small decal adapter:
+
+1. Transform with the same combined GS-scaled view/projection as the host and
+   clip homogeneous coordinates before dividing, using the renderer's actual
+   near plane and side guards.
+2. Derive depth slope from the original face, so a source vertex crossing W=0
+   cannot disable the correction. Exactly eye-coplanar zero-area faces skip
+   individually; they must not disable every other decal in the batch.
+3. Add an allowance in **actual GS depth units**, alongside the intended
+   material tier. The measured case-study implementation used
+   `2 + (abs(dZ/dX) + abs(dZ/dY))/8 + M*2^-22`, plus a transform-cancellation
+   allowance based on absolute matrix products and reciprocal W; `M` is the
+   active maximum depth. Check representable headroom instead of blindly
+   capping a required correction.
+4. Submit the chosen NDC depth with identity matrices and explicit
+   `S=u/W, T=v/W, Q=1/W`. The existing unlit X2 path accepts three texture
+   components, so perspective mapping survives without a microcode change.
+   Carry each material's source fog/alpha through clipping too.
+
+Keep the opaque surface as depth owner when the decal's numerical allowance
+must not occlude later objects. In the case study, both decal materials tested
+against opaque depth with writes disabled. Changing writes alone could not fix
+the initial host comparison; comparison tolerance and depth ownership were
+separate parts of the repair. Other pass orders need their own analysis.
+
+The reported fighting was corrected on hardware. A supporting model reproduced
+2,145 failures for the old 0.5% route and none in 221,849 corrected samples,
+but did not emulate all VU/GS arithmetic or pixel rules. The numeric allowance
+is a practical decal tolerance, not proof for every grazing view or nearly
+coincident unrelated occluder. Staging cost and occlusion coverage require
+separate checks.
+
+References: GS User's Manual p60 (STQ) and p139 (XYZF2), EE User's Manual p154
+(GIF packed extraction), for the packed-coordinate and interpolation contracts.
+
+### Alpha and 2D primitives
+
 Untextured alpha-blended primitives do not fade correctly. ps2gl scales
 untextured vertex alpha by 255, while the GS blend factor treats 128 as 1.0.
 Upper-half alpha values clamp or over-blend. If something must fade, make it
 textured with a 1x1 white texture under `GL_MODULATE`.
 
-raylib's 2D shape functions are unsafe or slow on PS2. They often emit
-untextured per-vertex color, which hits the missing unlit renderer. Use a PS2
+Stock raylib 2D shapes can select unsupported untextured varying-color
+state or pay excessive setup. The fork's explicitly admitted colored HUD
+renderer is a different route. Use a PS2
 shape helper that binds a GS-alpha-scaled 1x1 white texture, uses a single
 uniform color, disables culling, forces correct alpha blend, and flushes so it
 does not merge into a neighboring varying-color batch.
@@ -564,9 +638,6 @@ is `BL, TL, TR, BR`, which makes ps2gl's quad shader produce the cleaner
 diagonal. Integer snapping, half-pixel offsets, explicit triangles, and the old
 OpenGL 0.375 translation did not fix it.
 
-The old desktop OpenGL `rlTranslatef(0.375,0.375,0)` hack is unnecessary on PS2.
-The GS rasterization convention differs; keep the hack removed.
-
 ## Chapter 9 - Geometry, Clipping, Projection, and Display Lists
 
 Relevant manuals: GS User's Manual Ch 3 (Drawing Function) and Ch 4 (Image Data
@@ -581,6 +652,17 @@ not get safely discarded, it wraps into garbage. That single absence is why this
 chapter exists: every working 3D path here is really an answer to "who clips
 this, and against what guard band," whether that is the EE software clipper, a
 proven bounding-sphere bypass, or a whole-triangle cull.
+
+Projection range and clipping range must be considered together. Increasing
+projection near from 0.05 to 1.0 can recover about 20 times the far-depth
+resolution, but it is free only if every producer sharing that depth buffer
+already clips at 1.0. For example, if a close effect clips at 0.05,
+raising the whole scene's near plane to 1.0 removes valid geometry. Giving
+only distant scenery a different depth mapping also breaks its comparison
+with unchanged actors and backgrounds. Halving a very distant far plane does not double precision:
+with near fixed and far much larger, the reciprocal-depth coefficient changes
+only slightly. Neither adjustment guarantees agreement between differently
+quantized coplanar triangles; Chapter 8 addresses that separate problem.
 
 Raw world-space `glBegin` inside `BeginMode3D` does not work reliably on
 raylib4ps2. raylib's camera matrix and ps2gl's current `GL_MODELVIEW` can be
@@ -618,11 +700,11 @@ This keeps software-clipped geometry aligned with raylib's camera and
 - software-clipper meshes have already been clipped on the EE, so
   `PGL_CLIPPING` should be off or ps2gl can still reject distant valid draws.
 
-Particles are not an exception. With `PGL_CLIPPING` on, distant explosions thin
-out. But a particle is one triangle, so do not run the full software clipper on
-it. Do a cheap whole-triangle near plus four-side guard-band cull, submit raw,
-and drop any particle crossing a plane. Defer `rlBegin` until the first survivor
-so an all-culled bucket never emits a zero-vertex GIF packet.
+Whole-triangle rejection against near and side guards is an optional effect
+policy, not clipping: it may drop a visible edge. Use it only where that loss
+is acceptable. An ordered colored-array path and its fallback must preserve
+the same bucket order and avoid submitting work twice. Every producer needs
+its own clipping and capacity contract.
 
 Projective effects must be bounded. Anything using `1/zc` can explode as `zc`
 approaches zero. PC and DC viewport clipping can hide that; PS2 GS coordinates
@@ -633,39 +715,42 @@ guards.
 Display lists capture texture handles at compile time. They do not keep the
 source `Model` alive, but `UnloadModel` frees the textures the list references.
 Either keep model textures live for the list lifetime or delete/recompile the
-display list when loading/unloading the model. In the case study, the logo
-follows the PC/DC scene lifecycle by deleting the compiled list before unloading
-the model and recompiling when the model returns.
+display list when loading/unloading the model. For a scene-local model, delete its compiled list before unloading the model
+and recompile after loading it again.
 
-Display-list model culling is asset-specific. The F22 uses reversed winding and
-needs explicit culling state. Enemies mirror the player install-once shape but
-use a simpler uniform tint path instead of per-stage lighting.
+Client arrays queued by `packet.Ref()` outlive the draw function. A frame's
+double-buffered scratch cursor belongs to the frame owner, never to a material
+helper. In one failure, resetting it inside an effect draw overwrote an earlier
+queued skybox and produced broken sky textures. Saving and restoring the
+cursor would not restore the overwritten bytes. Append behind prior draws and
+recycle only after the frame owner has proved the referencing work complete,
+then selected the reusable buffer. Local stack input is safe
+only when the receiving helper copies it into retained storage before returning.
+A transactional adapter can stage into unpublished scratch, reserve all of its
+material passes together and publish only after success; fallback cannot expose a
+partial stream or reclaim earlier queued data.
+
+Display-list model culling is asset-specific. Record the source winding and
+set the required state explicitly. Separate invariant installed geometry from
+per-frame tint or lighting inputs.
 
 Stream per-frame generated geometry through `begin/add/end` helpers. Do not
 pack several kilobytes of temporary primitive data on the EE stack before
 calling the backend; the stack can corrupt and surface as an instruction-fetch
-TLB exception. The water splash tooth emitter is the canonical pattern:
-begin sets state and resets a cached mesh, add appends each tooth, end clips and
-draws once.
+TLB exception. For a procedural strip or fan, begin sets state and selects reusable storage,
+add appends primitives, and end clips and draws the accumulated geometry.
 
-Flat per-vertex color needs a faked flat light. ps2gl has no unlit
-per-vertex-color renderer — every `PerVtxMaterial:kDiffuse` microprogram also
-requires `Lighting:1`, and per-vertex color is only transferred to VU1 when
-`GL_COLOR_MATERIAL` is enabled. With color-material off you silently get the last
-`glColor` for the whole batch; with it on but lighting off the lookup finds no
-renderer and faults. To render flat per-face colors (a procedural city of
-per-color building faces) without real shading, give every vertex the same
-constant normal and a single directional light pointing along that same eye-space
-normal, so `N·L ≡ 1` everywhere and the diffuse term passes the vertex color
-straight through unshaded. Use `glColorMaterial(GL_FRONT_AND_BACK, GL_DIFFUSE)`
-(only `GL_DIFFUSE` varies per vertex on ps2gl), zero ambient and specular, and
-configure the light under an identity modelview so its direction matches the
-emitted normal. The color must also survive the EE clipper, so the clip vertex
-carries RGBA and interpolates it across cuts.
+Stock lit per-vertex color paths need the established flat-light setup:
+constant normals, matching directional light, zero ambient/specular and
+`glColorMaterial(GL_FRONT_AND_BACK, GL_DIFFUSE)`. The fork additionally has
+an explicit `PGL_UNLIT_TEX_TRIANGLES` route for qualified prepared arrays.
+Verify renderer selection and optional attributes rather than generalizing
+either setup to arbitrary immediate-mode state. Clipping must interpolate
+the color/fog attributes owned by its consumer.
 
 ## Chapter 10 - Texture Formats, Alpha, and Filtering
 
-Relevant manuals: GS User's Manual Ch 2 (Local Memory) for the PSMCT32/16/8/4
+Relevant manuals: GS User's Manual Ch 2 (Local Memory) for the PSMCT32/16 and PSMT8/4
 pixel-storage modes, CLUT storage, and page/block geometry; Ch 3 (Drawing
 Function) for texture mapping, the TEXA alpha expansion, and filtering; Ch 8
 (Details of GS Local Memory) for addressing; `ps2textures.htm` as a quicker
@@ -688,15 +773,16 @@ decode to many megabytes in EE RAM and fault when an image decoder walks past
 allocation failure. Keep the original aspect unless intentionally changing art.
 
 PSMCT16 halves VRAM for opaque art. A 512x512 RGBA32 texture is 128 GS pages and
-does not fit the default 64-page largest slot; 16-bit 5551 is 64 pages and fits.
+needs a 128-page slot; 16-bit 5551 needs 64 pages. In a map whose largest
+compatible slot is 32 pages, neither fits without a different asset or layout.
 Pack in GS bit order: red in the low five bits, then green, blue, alpha in bit
 15. Remember the cost: only one alpha bit. Cutout sprites, fonts, and smooth
 alpha art should not use this path.
 
 PSMT8 paletted textures are the practical workhorse. They use 8-bit indices plus
 a 256-entry 32-bit CLUT, giving quarter-size texture bodies with full CLUT alpha.
-The case study eventually moved the full PS2 texture set to PSMT8 at full
-console-target resolution.
+Choose per asset: RGBA32 can preserve gradients and smooth alpha without a
+palette, while 16-bit storage can suit opaque material families.
 
 PSMT8 rules:
 
@@ -720,13 +806,23 @@ distinct colors at neighboring entries. If PCSX2 hardware and software agree on
 wrong colors, suspect data/alignment, not sampling.
 
 Texture alpha stored in GS memory needs the GS scale. Procedural alpha textures
-should run through `ps2_image_alpha_to_gs_range()` before upload. Runtime
+should convert source alpha from 0..255 to 0..128 before upload. Runtime
 `glColor4ub` is already normalized by ps2gl; do not rescale runtime colors
 again unless bypassing ps2gl.
 
-Texture filter and wrap state changed over the life of the fork. Current rule:
-state every asset's filter explicitly. Point-sampled font atlases and 1x1 solid
-textures should be nearest. Bilinear 1x1 textures can flicker on hardware. When
+Procedural atlas details must also survive the actual texel grid. Even-sized
+cells have no texel centered at their geometric origin. With a normalized
+radius spanning -1..1, the nearest texel-center radius in a 16x16 cell is
+0.0884; an analytic dot smaller than that can exist in the formula yet produce
+no sample on PS2. Validate generated radial features at the texel centers of
+the smallest shipping cell. For light sprites, keep raster-space exposure
+coverage broad enough to be sampled and tune RGB whitening independently from
+alpha/energy. If one atlas cell and one quad already express the effect, repair
+the texture generator rather than adding runtime geometry, passes or adjacent-
+cell crossfades.
+
+State every asset's filter and wrap mode explicitly. Point-sampled font atlases and 1x1 solid
+textures should use nearest filtering where exact texel sampling is required. Bilinear 1x1 textures can flicker on hardware. When
 using raw `glTexParameteri`, pass ps2gl's `GL_REPEAT` and `GL_CLAMP` symbols, not
 desktop numeric constants; ps2gl's enum values differ.
 
@@ -749,31 +845,27 @@ mip base pointers.
 
 Mipmaps on this stack are a build-it-yourself feature: the GS hardware does them
 natively through TEX1 and MIPTBP, but ps2gl ships no path to drive those
-registers, so this chapter is the manual upload recipe. It pairs with dithering
+registers in its upstream baseline; the fork supplies the ownership and upload
+paths described here. It pairs with dithering
 because both are about fighting the precision loss of a 16-bit framebuffer — one
 in texture LOD, one in the final store — and both fail in instructive,
 hardware-only ways that an emulator renders perfectly.
 
-ps2gl did not ship a mipmap path. Real GS mipmaps require:
+The fork now supports mipmaps as per-texture state. Each pyramid needs TEX1
+filter/LOD configuration, valid MIPTBP addresses and resident ownership for all
+levels. Legacy paths pin separate allocations; qualified packed formats share
+an owner with proven block offsets and sampler strides. Other shapes retain
+the legacy fallback.
 
-- `TEX1.MXL` and `TEX1.MMIN` on the texture's environment;
-- explicit `MIPTBP1` and `MIPTBP2` base pointers for levels;
-- per-level resident textures;
-- locked mip slots so ps2gl's allocator does not reuse them;
-- an LOD bias in `TEX1.K`, often strongly negative for grazing floors because
-  the GS has no anisotropic filtering.
+MIPTBP addresses need not be contiguous. Re-emit each texture's MIPTBP with its
+settings, rather than one global load-time packet. Multiple pyramids coexist
+within the slot budget. Deep teardown releases hidden levels and shared owners
+exactly once. Reconstruct the complete pyramid after a VRAM-layout wipe:
+sampled-only levels do not lazily bind themselves. Chapter 21 covers lifetime;
+Chapter 33 covers packed mipmaps and atlas isolation.
 
-MIPTBP addresses need not be contiguous. Upload each mip as its own resident
-texture and harvest each GS base pointer. Do not rely on automatic contiguous
-mip addressing.
-
-MIPTBP is global enough to bite. With more than one live mipmapped floor, the
-new texture can stomp the previous texture's mip pointers. The case-study
-policy: only one mip texture live at a time, release the old pyramid before
-creating the new one, and deep-unload floors during stage changes.
-
-The GS supports trilinear (`MMIN = 5`) in one pass. The Dreamcast/PVR trilinear
-black-surface rule does not apply to GS. But real hardware blends mips with
+The GS supports trilinear (`MMIN = 5`) in one pass. Rules for other console
+texture units do not determine GS behavior. Real hardware blends mips with
 limited precision. PCSX2 can show perfectly smooth trilinear gradients while the
 real GS shows faint stepped bands. Use a mip-tint probe to verify whether
 MIPTBP/MXL/MMIN are working and where transitions land.
@@ -804,11 +896,12 @@ honestly — and the non-obvious facts that textures are double-resident by
 default, and that for VRAM the number that matters is the largest *single* free
 slot, not the total free page count.
 
-Audit raylib4ps2's immediate buffer first. `pglInit(128*1024, ...)` allocates
-about 16 MB across double-buffered immediate geometry arrays. The case study
-reduced this to `32*1024` qwords and reclaimed about 12 MB of EE RAM while
-keeping large headroom. Display-list models do not use that immediate buffer;
-software-clipped raw geometry does.
+Audit immediate-buffer units and the actual caller override. One ps2gl
+integration reduced an immediate capacity of 128*1024 vertices to 32*1024,
+reclaiming roughly 12 MB from approximately 16 MB of immediate arrays. A later
+16*1024 setting was an application-specific budget, not a recommended SDK
+default. Count vertices, not qwords, and include retained lists, custom client
+arrays and the capacity required by their fallbacks before selecting a size.
 
 Use `mallinfo()` for live EE heap readings. On PS2, `uordblks` and `arena` tend
 to be close because the heap does not return pages to the system, but it is still
@@ -829,147 +922,98 @@ Default GS slot maps are as important as texture byte size. A 512x512 texture is
 largest free slot is 64 pages, full-res 24/32-bit cannot fit regardless of total
 free pages.
 
-## Chapter 13 - Effects and Scene-Specific Rendering
+## Chapter 13 - Procedural Effects Under GS Constraints
 
 Relevant manuals: GS User's Manual Ch 3 (Drawing Function) for perspective-
-correct texturing, alpha blending, and the precision behavior behind UV wobble;
-VU User's Manual for the transform path. Case-study specifics come from the
-development notes.
+correct texturing, blending and coordinate precision; VU User's Manual for
+transform and clipping paths.
 
-This chapter is the most game-specific in the handbook, but the techniques
-generalize: how to couple sky/floor/haze geometry so pieces never poke through
-each other, how to keep projective effects (speedlines, lens flare) from
-exploding near their `1/z` singularities, and how to keep UV magnitudes small
-enough that the GS's reduced-precision perspective division does not visibly
-swim. Treat the specific effects as worked examples of those three ideas.
+Effects must obey the same clipping, state and lifetime contracts as opaque
+geometry. Small screen coverage does not imply small projected coordinates,
+and a transparent texture does not make an unclipped triangle safe.
 
-Skybox, floor, haze, and water-wall geometry are coupled. Keep them on the same
-polygon chord endpoints and slice assumptions so haze or floor pieces do not
-poke past the sky cylinder. The PS2 helper meshes bake absolute floor Y; the
-world anchor moves them in X/Z only. Do not subtract `world.origin.y` a second
-time.
+### Coupled geometry and depth ownership
 
-The underwater wall's vertical scroll is intentional. It reads as rising
-current. Keep the under-cap and wall as separate meshes/draws because the cap
-uses floor forward scroll while the wall adds its own vertical scroll.
+Procedural backgrounds that meet along a shared edge must agree on polygon
+endpoints and coordinate frames. For a faceted cylinder, the visible wall lies
+at the polygon inradius between vertices, not at the nominal vertex radius.
+Using inconsistent slice geometry can expose seams that resemble depth bugs.
 
-Translucent haze ports cleanly through the software clipper. Build CPU-side
-mesh arrays, use GS-scaled texture alpha, draw after opaque environment, and
-avoid exact-coordinate z-fighting. On PS2 the haze renderer is its own clipped
-path; on Dreamcast a different depth-state rule may apply.
+Compose coplanar color layers before publishing depth when independently
+quantized depth would make those layers fight. One background design draws
+ground color and its overlays, replays ground depth without color, then draws
+the enclosing sky with strict depth comparison. A haze layer can be composed
+as background before opaque objects when the viewpoint and scene contract
+permit it. This is an example, not a universal pass order: views outside the
+enclosure or below the ground can need a depth-tested alternative. Define
+which pass owns depth and which later elements must remain visible.
 
-Speedlines need PS2-specific projection discipline. Derive the vanishing point
-from player yaw, manually project with signed `zc`, clamp the drawn VP offset,
-fade based on horizontal offset near the yaw singularity, and reject non-finite
-coordinates by bit inspection. The discontinuity at 90 degrees is mathematically
-real; hide it with fade rather than using `abs(zc)`, which puts the VP on the
-wrong side.
+### Projected cards, streaks and beams
 
-Speedline alpha is texture-modulated on PS2. Because varying vertex colors are
-unsafe, bake the tail-to-head ramp into a texture and use uniform alpha per
-quad/bucket. Match head brightness to the cross-platform path and accept the
-slightly brighter tail.
+Projective effects using `1/z` become singular near the view plane. Preserve
+the sign of view-space depth, bound projected offsets and fade an effect before
+its intended representation becomes discontinuous. Taking `abs(z)` can put a
+vanishing point on the wrong side of the screen. Under `-ffast-math`, use a
+non-finite check that the compiler cannot optimize away, such as exponent-bit
+inspection, before writing GS coordinates.
 
-Lens flare occlusion should test the sun disc, not only the center. Sample the
-center plus cardinal perimeter points, ray-test against model OBBs, and scale
-flare alpha by visible sample fraction. Spheres over-occlude long thin models;
-world AABBs fail when the model rotates. Inverse-rotated OBB slab tests match
-the model orientation and avoid rebuilding boxes.
+A textured ramp with uniform vertex alpha is useful when a selected ps2gl
+renderer lacks the required varying-color path. Match this representation's
+brightness and blend behavior deliberately; it is not automatically equivalent
+to the original vertex ramp.
 
-Particles need both sim and renderer policy. Simulation uses priority eviction
-so explosions beat sparks and sparks beat trails. Rendering uses PGL clipping
-off, whole-triangle culling, white texturing for alpha fade, quantized RGBA
-buckets, and a no-empty-batch guard.
+Long beams and near-crossing cards need a real clipper. A fast path proven for
+compact distant billboards does not qualify a long thin triangle or an expanded
+clipped fan. Account for worst-case output capacity and preserve every required
+attribute. Fog must affect the complete textured result: multiplying vertex
+RGB alone cannot lift black texels toward a nonblack fog color.
 
-A fixed-step inner loop must restore every global it borrows. The attract
-recorder restored `game.time` but not `game.dt`, causing the cinematic camera to
-run at frame speed after deterministic sim ticks. On 60 Hz consoles the bug was
-invisible; on uncapped PC it shifted choreography and made the PS2 renderer look
-guilty for missing bullets that no longer existed at that timestamp.
+View-plane billboards share the camera's orientation and can reuse one basis
+per frame. Position-facing billboards instead rotate toward the camera position;
+they produce a different appearance. Choose the intended geometry explicitly.
+Either representation must establish its own cull, blend, depth-test and
+depth-write state. A visible debug triangle through the same route helps
+distinguish an empty producer from a state path that rejects every fragment.
 
-Clamp bad `dt` values immediately after reading frame time. Use
-`if (!(dt > 0.0f) || dt > max)` so NaN and negative values reset too. NaN state
-is sticky and can poison cameras, positions, and debug displays permanently.
+Avoid unsupported empty immediate batches, but do not equate them with every
+zero-count GIF packet. Validated VU paths can use `NLOOP=0, EOP=1` completion
+tags; the packet protocol determines whether an empty packet is valid.
 
-A sweeping searchlight cut by the world is a bake problem, not a raytrace
-problem. The naive shape — a light cone terminated at the first wall it strikes —
-is a raycast per beam per frame, and on a streaming world that cost detonates on
-the admission edge: the frame that pulls a new window into view pays for every new
-candidate at once. Memoizing "once per building" does not help, because a window
-admits hundreds of buildings in one frame; moving the scan from the stream build to
-a gather at ground rebuild only relocates the same burst. The fix is to precompute
-everything the camera cannot change and leave the runtime only the part it must.
-Bake the light placement, the sweep amplitude, and — because the billboard facing
-is unknowable offline — a full 360-degree gather of the buildings the cone could
-ever intercept, cleared down to a handful by a conservative height heuristic and
-stored as small record indices into the existing world bake. At runtime each beam
-does only a 2D slab test of its two cone edges against those few candidates and
-reshapes the primitive. Never bake a lookup table of a camera-dependent quantity
-(a pre-cut length that assumed a facing is a stale-bake bug by construction); bake
-only invariants, and compute the facing, the sweep phase, and the cut live.
+### Move invariant work out of the frame
 
-Billboard by the camera's orientation, not its position. Position (radial)
-billboarding gives every object its own yaw, so neighbors disagree and each sprite
-visibly rotates on its axis as the camera strafes; orientation (view-plane)
-billboarding shares one facing across the whole field and costs a single normalize
-per frame rather than one per object. It is also the sprite-correct look. A
-corollary for planar effects: a fan spread across azimuth lies in a slanted plane
-and goes edge-on invisible from common angles, whereas a vertical billboarded plane
-reads from every side — and its intersection with a vertical prism is exactly a 2D
-rectangle, which turns the visibility cut into a flat slab test rather than 3D
-geometry.
+The EE benefits when effect preparation separates invariant geometry from
+camera-dependent work. For a beam clipped against static scenery, precompute a
+conservative candidate set, then test only those candidates against the live
+beam. Prune against the maximum supported sweep or width, not merely its
+default. Do not bake a cut distance that assumes a camera-facing direction
+which will change at runtime.
 
-An offline bake shared with the runtime needs a single-sourced contract and a
-provably conservative prune. Put every constant both the baker and the game depend
-on in one header included verbatim by both, so a tuned value cannot drift between
-producer and consumer (the same stale-profile hazard that a hardcoded second copy
-always eventually causes). Make the baker's coordinate decode match the game's bit
-for bit, including any world-space mirror or height conditioning. And when the bake
-prunes candidates with a heuristic gated by a runtime knob, prove the bound against
-the knob's ceiling, not its default value — a cone that can widen at runtime must
-still find every blocker the bake kept, or beams punch through buildings that were
-cleared offline.
+Producer and runtime must share coordinate decoding and all constants used in
+conservative bounds. Store cached geometry in an explicit stable frame and
+apply a live origin delta once; paired hidden compensations in both stored
+vertices and camera transforms are prone to double application.
 
-A long thin additive primitive is the inverse of a particle quad. Small
-screen-facing quads are culled whole and never clipped, but a beam is large and must
-be clipped — just not by the wrong clipper. It cannot ride a raw no-clip path
-(coordinates past the GS 2047 window wrap into garbage) and it cannot ride a
-fixed-output-cap clip microcode (an oversized clipped fan is silently dropped, the
-same reason large land polygons stay on the EE clipper); route it through the EE
-software clipper, whose cost at these vertex counts is negligible. Texture it, too:
-untextured vertex alpha does not fade on the GS (untextured color caps at 255 versus
-128 textured), so an additive gradient renders as a flat slab unless it is textured.
-And guard the empty batch, because a GIFtag with NLOOP zero hangs the GS.
+For animated sprite fields, cache stable positions, phase and amplitude. Reject
+motion-expanded bounds before evaluating individual animation, then test the
+surviving animated positions precisely. For sprites inside a faceted cylinder,
+an inradius-based bound such as `radius*cos(pi/slices)-clearance` accounts for
+the actual wall. Reuse a renderer only if it already provides the needed
+blend, depth, atlas and clipping contract. Measure both EE preparation and
+submission costs; fewer trigonometric calls alone do not prove frame savings.
 
-When the same effect is re-expressed in a second, immediate-mode renderer, two
-portability traps surface that the PS2 path had silently handled. The first: an
-immediate-mode draw pass inherits whatever global render state the previous pass left
-set — cull, blend, depth-test, depth-write all leak forward. A pass that draws
-view-dependent-winding geometry (billboards, camera-facing cards) must therefore set
-its own cull state, because from the wrong side every triangle is back-facing and
-silently culled. The PS2 beam pass had never shown this because it explicitly disables
-face culling for its own draw; that explicit prologue has no automatic counterpart
-when the pass is rebuilt in a different API, so port the state calls too — they are
-part of the pass, not boilerplate. The fastest way to localize such a bug is a
-fullbright sentinel: draw one unmistakable triangle dead-ahead through the same path.
-If the sentinel shows but the real geometry does not, the emit is empty (a data
-problem); if even the sentinel vanishes, the draw state is killing pixels (a state
-problem) — one run splits the two.
+### Separate simulation evidence from rendering evidence
 
-The second trap concerns data shared across renderers. A cache that snapshots a
-per-frame offset and cancels it with a matching compensation applied elsewhere is
-correct only while every consumer honors that unstated pairing. HyperSolar's ground
-stack bakes each rebuild's floor drift into its vertices and cancels it by shifting the
-draw camera's eye; the PS2 software clipper takes an explicit per-pass eye and can
-participate, but a fixed-view renderer that locks one view matrix per pass cannot, and
-fixing only half the pipeline re-creates the error inverted (the earlier PS2
-double-shift, where emit moved to live drift while the draw still applied the
-compensated eye). The durable cure is to make the data self-describing rather than
-paired: store in a stable frame, apply the live per-frame delta at the single point of
-emit, and hand every renderer a plain camera. It works here because the beam's cut math
-is relative — cone edges against building corners — and therefore translation-invariant,
-so it runs in the stable frame unchanged. Prefer data that carries its own frame over
-data that needs a correction applied somewhere else.
+Before debugging an apparently missing effect, prove the simulation emitted
+it at that timestamp. A borrowed fixed-step clock must restore every affected
+time value, not only absolute time. A timing error hidden by a capped frame
+rate can produce a different effect population on an uncapped host and look
+like a PS2 clipping failure.
+
+Validate frame deltas before updating persistent state. In builds where normal
+floating-point comparisons retain IEEE behavior, `!(dt > 0.0f) || dt > max`
+rejects NaN, nonpositive and excessively large values. Under fast-math, retain
+an explicit bit-level non-finite check. NaN state can otherwise contaminate
+cameras and projected coordinates across subsequent frames.
 
 ## Chapter 14 - Input, Debug UI, and Save Data
 
@@ -977,34 +1021,30 @@ Relevant manuals: EE Overview Manual Ch 2 for system context (the IOP owns pad
 and memory-card services, the EE reaches them over SIF RPC). libpad and libmc
 behavior is ps2sdk-specific; the rules here are practical, from the case study.
 
-Input, the debug UI, and save data are grouped because they share one theme:
-they all cross the EE↔IOP boundary through libraries that are unforgiving about
-buffer placement and init ordering. The recurring failure here is not a wrong
-value, it is a DMA writing into a stack buffer and corrupting a return address —
-so the rules are mostly about *where* memory lives (file-scope, aligned,
-uncached) and *when* you initialize (before raylib touches SIF RPC).
+Pad and memory-card services cross the EE/IOP boundary. Keep DMA/RPC storage
+aligned and alive, and initialize services in the owned boot sequence.
 
-Map libpad into the shared `PadState` early. Cross, Circle, Square, Triangle map
-to A, B, X, Y in the xbox-style game abstraction; d-pad, sticks, and digital
-triggers fill the shared fields. Keep raw libpad state for PS2-only debug inputs
-such as SELECT or shoulders and for the input debug overlay.
+Translate libpad into an application input abstraction with an explicit button
+mapping. Retain access to platform-specific controls and raw state for
+diagnostics; no particular console-to-console button naming is required.
 
-Debug menu platform rows should be platform-real. FPS target is `PC_ONLY`, not
-PS2. PS2 is display/vblank locked. PS2's Graphics submenu owns video mode
-448i/448p, aspect 4:3/16:9, anti-aliasing, dithering, the interlace flicker
-filter (interlaced modes only), screen fit/pos where implemented, and
-memory-card save target.
+Diagnostic controls should expose the hardware behavior being investigated:
+video timing, framebuffer size, aspect, dithering, edge AA, interlace filtering,
+screen position or fit. A frame-rate target only makes sense together with the
+application's presentation policy. Do not confuse render rate, field rate and
+the rate of unique frames reaching scanout.
 
-GS edge AA on opaque models can read as a black cel outline rather than soft
-anti-aliasing. Default it off and expose it as a debug option rather than
-assuming it is a visual improvement.
+GS edge AA on opaque models can read as a dark outline rather than soft
+anti-aliasing. Compare it on hardware with the intended blend and coverage
+behavior before choosing a default.
 
 For memory-card saves, initialize libmc before GL/raylib init. `mcInit()` calls
 `sceSifInitRpc(0)` unconditionally; running it late can desync ps2link fileio.
 Load `rom0:SIO2MAN`, `rom0:MCMAN`, and `rom0:MCSERV`, then `mcInit(MC_TYPE_MC)`.
 Use the plain modules, not the `X*` variants.
 
-libmc result and transfer buffers must be file-scope and 64-byte aligned. The
+Keep libmc result and transfer buffers alive through RPC completion and
+64-byte aligned; static storage is a simple way to satisfy the lifetime rule. The
 RPC DMA writes into them; stack buffers can corrupt return addresses and surface
 as instruction-fetch exceptions.
 
@@ -1013,26 +1053,21 @@ OK card state for this flow. `-2` is unformatted, and values below about `-10`
 indicate no card. `mcClose` commits through MCMAN's cache; successful write plus
 close persisted across power-off in hardware tests.
 
-Under ps2link, libmc RPC bursts can leave the next unrelated fileio call broken.
-A single blocking stdout write heals the shared ps2link path. This is a
-dev-loader artifact, not a real hardware save bug, but centralize the barrier so
-it is understood rather than scattered as mysterious prints.
+A historical save investigation found a blocking stdout write changed whether
+a later ps2link fileio call failed. This is timing-sensitive diagnostic evidence,
+not proof of a synchronization barrier. A workaround of that kind does not explain the shared-service ordering; fixes must establish readiness
+and completion rather than rely on print latency. Standalone persistence and
+dev-loader reliability require separate checks.
 
 A BIOS-browsable save needs a directory with `icon.sys` and an `.icn` model.
 Missing either appears as "Corrupted Data." The icon model is a tiny animated 3D
 format with 16-bit fixed-point positions/normals/UVs and a 128x128 BGR555
 texture. Write it once and avoid rewriting it on every save.
 
-For `.icn` geometry, follow the BIOS camera conventions:
-
-- the BIOS/mymcplus reference effectively negates Y and Z on load;
-- the icon rotates/zooms around model point `(0, 2.5, 0)`;
-- written Y around `-2.5` centers the model on that pivot;
-- keep geometry tiny, such as a textured cube or card;
-- wind faces CCW outward;
-- flip the texture 180 degrees.
-
-The case study's GLB-to-ICN converter captures those rules.
+For `.icn` geometry, the BIOS/mymcplus reference negates Y/Z and rotates
+about (0, 2.5, 0). An exporter targeting that convention must account for the model origin,
+winding and texture orientation. Verify the result in the actual BIOS browser
+rather than assuming a desktop model viewer uses the same coordinates.
 
 ## Chapter 15 - SPU2 SFX Fundamentals
 
@@ -1070,7 +1105,7 @@ wait with `sceSdVoiceTransStatus`, then free the IOP buffer.
 
 SPU2 pitch is native and should be used. For 48 kHz samples, `PITCH = 0x1000`
 means unity playback. The usable range is `1..0x3FFF`, roughly -12 to +2
-octaves. Encode samples at 48 kHz so unity pitch is exact.
+octaves. Other encoding rates need a corresponding base pitch.
 
 For continuous loops whose amplitude is driven by game mix code, use instant
 attack and flat full sustain ADSR so `VOLL`/`VOLR` are the actual level. Update
@@ -1086,13 +1121,30 @@ Loop and one-shot ADPCM block flags differ:
 - loops set first block `0x06` and last block `0x03`;
 - one-shots set only the final block `0x01` END flag.
 
-One-shots should use a round-robin voice pool. Re-keying a still-playing voice is
-an acceptable evict-oldest policy. In the case study, loops use voices 0-3,
-one-shots use 4-11, and music uses 22/23.
+One-shots need an explicit allocation and voice-stealing policy; a round-robin
+pool is one simple choice. Re-keying a still-playing voice steals that
+playback. Reserve persistent loop and streaming voices separately, and treat
+voice numbers as application allocations rather than SDK conventions.
 
 Keep shared mix math shared. The case study moved target volumes, smoothing,
 ducking, pan, and SFX suppression into common code so PC/web, Dreamcast, and PS2
 differ only at the leaf "set this voice/stream" layer.
+
+### Live control needs playback identity
+
+A reusable SPU2 voice number is not the identity of one playback instance.
+If a one-shot is stolen and its slot reused, a stale live-mix record must not
+change the new sample's volume or stop it. Pair the index with a generation
+counter, advance ownership when assigning the slot, and validate range,
+generation and active state before every retained update or stop. Keep
+reserved loop ownership separate from the recyclable one-shot pool.
+
+This is especially relevant to a layer debugger: disabling new emissions
+does not silence already-playing voices, while stopping by sample identity
+can affect overlapping instances. Fade and stop the exact owned playback.
+Test stolen slots, overlapping instances and stale handles explicitly;
+source ownership checks and successful ordinary playback establish different
+parts of the contract.
 
 ## Chapter 16 - Music Streaming and Custom IOP Modules
 
@@ -1104,16 +1156,17 @@ transfers ride on.
 Music is where the SPU2's "not a stream player" nature collides with reality: a
 song is too big to fit in SPU2 RAM, so you must continuously refill the half of
 a ring buffer the voice is not currently reading. The hard-won conclusion of
-this chapter is architectural — that refill loop belongs on the IOP as a custom
-IRX, not on the EE render thread — and getting there means writing your first
-IOP module and learning why the stock streaming API deadlocks.
+this chapter is architectural: keep blocking refill work away from the EE
+render thread. A custom IOP module is one way to provide that separation; its
+command, file-I/O and DMA responsibilities still need explicit ownership.
 
-Do not use ps2snd's stream API for music in this project shape. `sndStreamOpen`
-deadlocked the IOP on both `host:` and legacy `mass:`. Its model opens files on
+Evaluate the file-I/O and scheduling dependencies of a streaming API before
+using it. In the case study, ps2snd's `sndStreamOpen` deadlocked the IOP on both
+`host:` and legacy `mass:`. Its model opens files on
 the IOP inside blocking RPC/stream machinery, which collides with ps2link fileio
 and lazy USB mounting.
 
-The working design is a custom SPU2 ring streamer:
+A custom SPU2 ring streamer can separate these responsibilities:
 
 - two voices, one per stereo channel;
 - each voice uses a two-half ring in SPU2 RAM;
@@ -1124,11 +1177,12 @@ The working design is a custom SPU2 ring streamer:
 - rewind at EOF for looping tracks;
 - keep VMIX bits routed into the dry mix.
 
-Run the streamer on the IOP, not the EE. An EE-side streamer worked but caused
+Keep file I/O and SPU DMA out of the render thread. In the case study, an
+EE-side streamer worked but caused
 frame hitches and GS margin artifacts during screen changes because file reads
 and SPU DMAs touched the render thread. Moving file I/O and SPU DMA to a custom
 IRX made the EE send only play/stop/volume/pause RPCs and eliminated per-frame
-audio work.
+audio refill work from the EE frame loop.
 
 The IOP module's RPC handler should not do blocking file reads or SPU DMA. It
 should copy the request, signal a stream thread, and return after consuming the
@@ -1136,9 +1190,9 @@ command. The stream thread opens, primes, polls NAX, reads, and transfers. Poll
 with a short `DelayThread`; avoid SPU IRQ file I/O.
 
 Music and SFX share core-wide VMIX registers. Both owners must OR their bits in
-without clearing the other side. In the case study, the EE SFX VMIX accumulator
-is seeded with music voices 22/23, while the IOP read-modify-writes to preserve
-SFX bits.
+without clearing the other side. Define the reserved voice masks and coordinate
+register ownership; a read-modify-write only preserves another owner's bits
+when competing writes cannot race it.
 
 Custom IRX build traps:
 
@@ -1150,8 +1204,9 @@ Custom IRX build traps:
 
 For USB, use the BDM/iomanX stack and the `mass0:` device: `iomanX.irx`,
 `usbd.irx`, `usbmass_bd.irx`, `bdm.irx`, and `bdmfs_fatfs.irx`, in order. This
-is not legacy `usbhdfsd` `mass:`. The BDM stack mounts eagerly; a failed open
-usually means "not mounted yet", so retry.
+is not legacy `usbhdfsd` `mass:`. The BDM stack mounts eagerly, but a failed open during startup can mean
+mounting is incomplete. Retry within a bounded readiness policy while
+distinguishing missing files and permanent I/O failures from mount progress.
 
 If the EE reads from iomanX instead, add `fileXio.irx`, call `fileXioInit()`,
 and use `fileXio*`. Define `NEWLIB_PORT_AWARE` before including `fileXio.h` if
@@ -1189,12 +1244,13 @@ Validate standalone boot separately from ps2link boot. ps2link can mask missing
 IOP reset/SBV setup and can introduce its own memory-card/fileio interop hazard.
 
 When a renderer "loses" an object, first prove the object exists at that instant.
-The attract bullet investigation burned time in clipping and draw-state probes
-when the timeline bug meant the bullets were no longer being submitted.
+For example, a recorded-sequence investigation spent time on clipping and
+draw state before revealing a simulation clock error: the supposedly missing
+projectiles were no longer being submitted.
 
 When diagnosing GS margin flashes, distinguish framebuffer contents from
-BGCOLOR. If the flash appears only outside the active 640x448 frame, fix
-BGCOLOR timing rather than clears or fullscreen fills.
+`BGCOLOR`. A flash confined to the margins directs investigation toward
+display state; clearing the active framebuffer cannot change those pixels.
 
 When diagnosing color/palette corruption, compare PCSX2 hardware and software
 renderers. If both match the same wrong output, suspect uploaded data, DMA
@@ -1208,7 +1264,7 @@ Do not publish speculative lessons as proven facts. Keep a working engineering
 log if you like, but promote entries into a public manual only after they have
 survived real validation.
 
-## Chapter 18 - ps2gl and ps2stuff Fork Delta
+## Chapter 18 - Extending ps2gl and ps2stuff at Ownership Boundaries
 
 Relevant manuals: GS User's Manual Ch 7 (Registers) for the register fields the
 fork drives — `PRIM.AA1`, `DTHE`/`DIMX`, `TEX1`, `MIPTBP1/2`, `DISPLAY` — and
@@ -1216,31 +1272,14 @@ Ch 5 (CRTC) for the display state the runtime-mode helpers touch; EE User's
 Manual for the DMA paths; VU User's Manual for the VU1 context behind ps2gl's
 clipping and immediate rendering.
 
-The preceding chapters describe scars on the game side; this one describes what
-had to change *inside* the libraries to make those fixes possible, and — for
-anyone maintaining their own ps2gl/ps2stuff fork — which of those changes look
-upstreamable versus project-local. Read it as both a changelog and a design
-critique: several of the deltas are correct-but-narrow, and the text flags where
-a cleaner general API should eventually live.
+A PS2 graphics-library extension must live where its state and lifetime are
+owned. Memory queries belong beside the allocator; persistent GS state belongs
+in the packet that restores it; upload helpers must define ownership of retained
+EE data as well as GS storage.
 
-This chapter summarizes the fork-delta report for the case-study ps2gl and
-ps2stuff forks. The rest of the manual describes the scars from the game side;
-this chapter describes what changed in the libraries and which parts are likely
-useful to the broader PS2 SDK ecosystem.
-
-The high-level delta categories are:
-
-- build proof canaries;
-- GS memory usage query APIs;
-- runtime display mode and raster offset control;
-- centered viewport scaling for overscan/screen fit;
-- GS edge anti-aliasing exposure;
-- GS dither control through the draw environment;
-- per-texture CLUT ownership for PSMT8 textures;
-- PSMT8 convenience uploaders;
-- manual GS mipmap upload for PSMCT16 and PSMT8 textures;
-- manual mip texture lifetime and release tracking;
-- a Python replacement for the old VU `gasp` preprocessing step.
+The APIs below are examples from a ps2gl/ps2stuff fork, not standard ps2gl
+interfaces or an installation recipe. Their useful feature is the dependency
+boundary. A different fork can implement the same contract under different names.
 
 `ps2stuff` owns the GS memory allocator, so memory reporting starts there.
 `CMemManager::GetMemInfo()` walks locked slots and every slot list, accumulates
@@ -1265,9 +1304,9 @@ application
 
 For display positioning, the ps2stuff fork adds a narrow DISPLAY-only register
 push. The point is to shift the raster without re-sending unrelated display
-state such as `PMODE`, `DISPFB`, or `BGCOLOR`. The current helper writes
-`DISPLAY2`, matching ps2gl's active read-circuit assumption. A more general
-upstream API should choose DISPLAY1 or DISPLAY2 explicitly.
+state such as `PMODE`, `DISPFB`, or `BGCOLOR`. The example helper writes
+`DISPLAY2`, matching ps2gl's active read-circuit assumption. A general
+API should choose DISPLAY1 or DISPLAY2 explicitly.
 
 The corresponding ps2gl API is:
 
@@ -1332,7 +1371,7 @@ extern "C" void pgl_enable_dither(int enable);
 The important bit is not the function name; it is the route. Dither must live in
 the `CDrawEnv`, followed by `DrawEnvChanged()`, so ps2gl re-sends the correct
 state. A raw register poke is temporary and will be overwritten by the next
-drawenv send. A cleaner upstream shape would likely be `pglEnableDither()` or a
+drawenv send. A consistent public API could use `pglEnableDither()` or a
 `PGL_DITHER` capability.
 
 Per-texture CLUT ownership is the most direct correctness fix. The original
@@ -1340,9 +1379,8 @@ manager-global CLUT model fails with multiple simultaneous PSMT8 textures: the
 latest `glColorTable()` effectively changes the palette for other indexed
 textures. The fork gives each `CMMTexture` an owned `CMMClut`, has
 `SetCurClut()` attach the palette to the currently bound texture, and has
-`UseCurTexture()` load that texture's own CLUT. This should be reviewed for
-display-list behavior and deletion edge cases, but the concept is broadly
-upstream-relevant.
+`UseCurTexture()` load that texture's own CLUT. Display-list capture, palette updates and deletion must preserve that
+association; ordinary binds alone do not cover those lifetimes.
 
 The PSMT8 upload convenience API is:
 
@@ -1387,68 +1425,32 @@ extern "C" unsigned int pgl_create_index8_mip(
 );
 ```
 
-Both paths create a base GL texture, upload hidden resident mip textures, lock
-the mip slots, set base `TEX1` fields (`MXL`, `MMIN`, `K`, `LCM`, `L`, `MMAG`),
-and write `MIPTBP1/2`. The dependency chain is:
+Mip creation configures base TEX1 and retains MIPTBP in the texture's settings
+packet through `SetMipLevels`/`SetMiptbp`. Legacy creation pins hidden levels;
+qualified packed formats share an owner. A one-shot global MIPTBP write cannot represent multiple texture owners.
 
-```text
-application texture loader
--> ps2gl: pgl_create_mip16() or pgl_create_index8_mip()
--> ps2gl: CMMTexture::SetMipLevels()
--> ps2gl: pgl_send_miptbp()
--> GS TEX1 + MIPTBP1/2
-```
+`pgl_delete_mips(baseId)` releases registry-owned hidden levels/shared packed
+ownership before the appropriate base release. Preserve each format's teardown
+contract; packed non-mip textures can use their ordinary unload route.
+Coexistence is bounded by resident slot capacity, not one live pyramid.
 
-Release uses:
+Legacy VU build systems may depend on a macro preprocessor absent from the
+host toolchain. A replacement must define its supported subset: includes,
+macros, conditional assembly, repeats, equates and parameter syntax can all
+affect emitted code. One fork used a Python implementation of the required
+`gasp` subset. Compare emitted microcode and retain reproducible module inputs;
+Chapter 22 covers scheduler and instruction hazards.
 
-```c
-extern "C" void pgl_delete_mips(unsigned int baseId);
-```
+A linked-library marker identifies the implementation in an executable when
+installed archives and local forks coexist. It proves provenance; state,
+ownership and hardware behavior still need validation.
 
-That registry unlocks and deletes the hidden mip textures before the base
-texture is deleted separately. In the case-study fork the registry is deliberately
-small and pragmatic. A more upstreamable design should make mip levels owned by
-the base texture and should re-emit MIPTBP as texture state, otherwise multiple
-simultaneous mipped textures remain unsafe.
+## Chapter 19 - Delivering Vertex Fog to the GS
 
-The VU preprocessor replacement is `vu1/gasp.py`, a Python subset of the old
-`gasp` macro features needed by the current VU sources. It supports includes,
-macros, conditional assembly forms, repeats, `.equ`, macro parameters, `\@`, and
-`\&var`. Regeneration is gated behind `REBUILD_VU1=1`; normal builds expect
-checked-in `.vsm` output. Treat this as a compatibility tool, not a full
-assembler preprocessor.
-
-Canary prints are project diagnostics, not upstream candidates. Their purpose is
-to prove the build linked the intended fork rather than toolchain-installed
-archives. The same idea is useful in any project with nested forks, but the
-exact print strings should remain project-local.
-
-The fork report's upstreaming read is:
-
-- likely good candidates: memory info query, `pglGetGsMemInfo()`, DISPLAY-only
-  position push, runtime display offset, edge AA exposure, dither exposure, and
-  per-texture CLUT ownership;
-- candidates needing design work: runtime video-mode switching, centered
-  viewport scale, PSMT8 upload helpers, and full mipmap support;
-- project-local as-is: canary prints, relative sibling include paths, fixed-size
-  mip registry, and raw one-shot MIPTBP DMA as public behavior.
-
-Mipmap state ownership, once the largest unresolved library-design issue, is now
-resolved (Chapter 21): `MIPTBP1/2` moved out of a one-shot global register write
-and into each texture's settings packet, so any number of mipmapped textures
-coexist instead of the old single-owner invariant. Two further fork deltas landed
-alongside it and are the strongest upstream candidates in the set — GS hardware
-fog wired into the vertex kernel (Chapter 19) and an explicit texture-image
-ownership transfer that closes the "fork keeps the texels pointer" leak
-(Chapter 21) — together with the interrupt-drain freeze fix, the per-vertex-alpha
-kernel variant, and the renderer-registry zero-init (Chapter 20).
-
-## Chapter 19 - GS Hardware Fog: The Unit Works, the Fork Never Wired It
-
-The GS has a per-vertex fog unit and almost no OpenGL-ish fork uses it. The unit
-is real, it is free (it rides the vertex you were already sending), and the only
-reason your fork does not expose it is that whoever wrote the vertex kernel left
-the fog byte hardwired to zero. This chapter is how to turn it on.
+The GS blends a fog color using an interpolated per-vertex factor. A library
+can expose this without a separate geometry pass when its vertex packets
+already carry XYZF2. This is an integration contract across packet format,
+primitive state and VU1 output; the hardware unit alone is not enough.
 
 **The fog byte is already in the wire format.** A GS vertex in the XYZF2 form
 carries an 8-bit F field alongside X, Y, Z. Fork VU1 kernels that pack XYZF2
@@ -1474,8 +1476,9 @@ pointer, and the context's last qword can sit flush against the double-buffer
 base. A one-qword underflow then stomps that slot every frame. This is invisible
 for two decades when the stomped slot holds something tolerant (an unused clip
 constant); put your fog parameters there and it zeros them every frame — solid
-fog, insensitive to every parameter you change. The fix is a sacrificial pad
-qword between the context and the buffer base. The bisection that finds it:
+fog, insensitive to every parameter you change. In the affected layout a reserved pad
+qword separated the context from the buffer machinery. Establish the actual
+address range and correct the overlap; arbitrary padding is not a general repair. The bisection that finds it:
 hardcode the fog parameters as microcode immediates. If fog then works, the math
 is right and the bug is delivery, not computation.
 
@@ -1496,7 +1499,7 @@ is the reference for the kernel side; it is worth reading before reinventing it.
 *Manual reference: GS User's Manual, Drawing Function (fog, the F field, PRIM/
 PRMODECONT); Image Data Transmission (giftag REGS and XYZF2 packing).*
 
-## Chapter 20 - Fork Stability, Per-Vertex Alpha, and Batched Submission
+## Chapter 20 - Interrupt Completion, Vertex Alpha, and Batched Submission
 
 Three unrelated-looking problems that all trace back to how a 2001-era fork feeds
 the GS: an intermittent whole-machine freeze, alpha that silently dies, and an EE
@@ -1553,6 +1556,17 @@ skips), scales it into GS 0..0x80 range, and merges it into the output color.
 Make it backward-safe: an opaque stream baking alpha 255 → 1.0 → 128 must come
 out byte-identical, and constant-material renderers keep the stock path.
 
+**A compound renderer must declare whether its second material inherits alpha.**
+Shared geometry does not imply shared material semantics. Chapter 26 develops
+the case where an input alpha lane carries fog instead of opacity.
+A dual-context/dual-texture kick can reuse one geometry stream for an opaque base
+and an emissive overlay, but shared vertices do not define the semantic alpha
+relationship. In a settled draw, vertex alpha may carry base-light data and the
+emissive layer must ignore it; in a spawn fade, both materials must share the host
+transition. Pass an explicit `second_material_inherits_vertex_alpha` policy from
+the call site. Blend mode cannot infer it, and silently reusing one alpha source
+turns a performance optimization into a material-coupling bug.
+
 **Pipeline shape beats clock speed: batch the clipper output.** A 294 MHz EE lost
 to a 200 MHz SH4 on the same scene, because the PS2 path re-emitted every
 software-clipped vertex through per-vertex immediate calls (each a call chain plus
@@ -1561,9 +1575,10 @@ draw. The fix is the same on the EE: append clipped vertices to DMA-visible
 scratch arrays and flush one array draw per surface. The fork ref-DMAs client
 arrays straight to VU1 (float-only, tightly packed; lit paths still need a
 normals array — a single shared constant normal works). Two disciplines: the
-scratch must be double-buffered on frame parity, because the frame's DMA chain
-reads it asynchronously; and consecutive same-state draws merge, so order by
-state. The payoff beyond speed is memory — the immediate-vertex buffers shrink
+scratch remains immutable until referencing chains complete; double-buffer
+selection is safe only under that ownership contract. Adjacent compatible
+draws may merge without changing authored order; do not globally sort
+overlapping geometry merely to reduce state changes. The payoff beyond speed is memory — the immediate-vertex buffers shrink
 from a whole-frame worst case to HUD scale, refunding megabytes.
 
 *Manual reference: GS User's Manual, CRTC and the CSR/IMR interrupt registers;
@@ -1573,7 +1588,7 @@ for the kernel scratch model.*
 ## Chapter 21 - Coexisting Mipmaps and the Long-Run Reset
 
 Two topics that both surface only after the easy path works: making more than one
-mipmapped texture legal, and proving a long session leaks nothing.
+mipmapped texture legal, and measuring whether repeated teardown conserves memory.
 
 **MIPTBP is per-texture state — put it in the settings packet.** A first mip
 implementation that writes `MIPTBP1/2` once, globally, via a raw register packet
@@ -1581,7 +1596,8 @@ makes "exactly one mipmapped texture may exist" a load-bearing invariant — fin
 for a lone floor, fatal the moment a scene wants several mipped tiles. But
 `MIPTBP` is context state exactly like `TEX0`/`TEX1`/`TEXA`: its home is the
 texture's own settings packet, re-sent on every bind. Bake the pyramid addresses
-into each texture at create time and any number of mipped textures coexist;
+into each texture at create time and multiple pyramids coexist within the
+resident slot budget;
 textures with no mips carry a zero `MIPTBP` the GS never dereferences. One
 corollary bites on a VRAM-layout switch that wipes the slot map: a fork re-uploads
 a texture lazily on its next *bind*, but pyramid levels are never bound (only
@@ -1589,15 +1605,17 @@ sampled via `MIPTBP`), so after a wipe the re-uploaded base samples its levels
 from reassigned memory — correct up close, wrong in the distance. Every mipped
 texture must be deep-released before such a switch and recreated after.
 
-**Locked mip pyramids are a slot budget, not a page budget.** Each mip level is
-its own pinned allocation from the fixed slot partition, so N mipped textures cost
-`N × levels` *locked* small slots, permanently — independent of the trivial VRAM
+**Locked mip pyramids need slot and page budgets.** In the legacy route,
+each mip level is its own pinned allocation from the fixed slot partition, so N mipped textures cost
+`N × (levels - 1)` additional pinned mip slots plus base/CLUT demand — independent of the trivial VRAM
 the texels occupy. A batch of tiles with full pyramids can demand far more
 one-page slots than the pool holds; the locks then starve the CLUTs, which
 LRU-fight the leftovers and produce full-screen palette corruption while
 untextured and CLUT-less draws stay normal (the diagnostic tell). Before enabling
 mips on a batch of tiles, count `tiles × (levels − 1)` against the small-slot pool
-and recarve idle large slots if needed.
+and evaluate owner classes. Qualified packed routes instead share an owner;
+count their CLUT demand and preserve teardown. Recarving the map requires
+proof that all other resident demand still fits.
 
 **A 1-bit alpha key can be mipmapped — if you pick the filter for the blend.**
 The blanket rule "never mip a 1-bit-alpha texture" exists because a box filter
@@ -1614,12 +1632,13 @@ carries it; levels are only sampled). And a related default to know: a fork's
 alpha bit 0 to alpha 128 and passes a mid-threshold alpha test — so punch-through
 tiles render as solid quads until you override `TEXA` per texture (`ta0 = 0`).
 
-**The long-run reset is a memory-conservation proof.** A "reset the whole game"
+**The long-run reset tests conservation within its instrumentation.** A "reset the whole game"
 path — unload every asset, re-init, reload — is rarely a shipping feature, but
-getting its per-cycle memory delta to a flat zero is the only real proof you own
-your allocations. Instrument it: after the post-unload drain each cycle, snapshot
+a flat per-cycle delta supports ownership for measured pools. It cannot
+prove absence of every leak or cover pools absent from the instrumentation.
+Instrument it: after the post-unload drain each cycle, snapshot
 system RAM (`mallinfo().uordblks`) and live GS/VRAM (a fork memory query on PS2,
-the KOS texture-memory counter on Dreamcast). Judge the delta against a *running
+equivalent counters on comparison platforms). Judge the delta against a *running
 minimum* — the true drained floor — not against the previous cycle: a real leak
 raises the floor monotonically, while allocator fragmentation oscillates above a
 stable-or-dropping floor (the bookkeeping can even read below the steady value —
@@ -1655,16 +1674,15 @@ Relevant manuals: VU User's Manual Ch 3 (flags, hazards, pipelines) and the VU
 Instruction Manual for per-instruction flag/latency tables; GS User's Manual Ch 3
 for the packed GIF vertex formats the renderer emits.
 
-The endgame of the clipping story (Chapter 9): the EE software clipper moved into
-a custom ps2gl VU1 renderer that performs full five-plane Sutherland-Hodgman —
-near plane plus four guard-band side planes — directly in microcode. The EE
-submits raw eye-space triangles; VU1 classifies, clips, interpolates STQ, and
-emits GS packets. Same pixels, and the EE sheds the entire clip-plus-submission
-cost (a city pass went from 11-20 ms to ~9-14.7 ms at higher vertex loads, with
-the EE's draw-call time at ~4-5 ms/frame). This chapter is what that cost to
-learn: the extension seam is clean, but the VCL toolchain has real bugs, and a
-naive port of correct C onto correct VU semantics still fails until you know
-them.
+Clipping can move from EE preparation into a custom VU1 renderer while retaining
+the contract from Chapter 9. One ps2gl implementation performs five-plane
+Sutherland-Hodgman: the near plane plus four guard-band side planes. The EE
+submits eye-space triangles; VU1 classifies, clips, interpolates STQ and emits
+GS packets. In a historical city workload, the measured pass changed from
+11-20 ms to about 9-14.7 ms at higher vertex loads, with EE draw-call time around
+4-5 ms/frame. These are workload observations, not a universal cost bound.
+The extension seam is useful, but the tested VCL toolchain required careful
+inspection of its scheduled output.
 
 The extension seam needs no changes to ps2gl's renderer selection:
 `pglRegisterRenderer` plus `pglRegisterCustomPrimType` (a GLenum with bit 31
@@ -1686,17 +1704,20 @@ triangles all drop kicks a bare NLOOP=0 EOP=1 giftag — legal and
 hardware-verified. Stock lighting passes walk output 1:1 with input and cannot
 survive 1:N; resolve color in the main loop.
 
-The VCL toolchain bugs, in order of pain:
+The following failures were observed in the tested VCL toolchain. Verify the
+emitted program when using these techniques with another version:
 
 1. **vcl does not model VU-memory aliasing between pointer registers.** It will
    hoist one pipeline stage's loads above the previous stage's stores to the
    same address through a different pointer — the consumer reads the previous
    triangle's data, and which qwords hoist is a scheduler roll of the dice per
-   regeneration (positions can survive while texture coordinates die). Fence
-   every store-to-load seam with a branch to the next line: the label is a
+   regeneration (positions can survive while texture coordinates die). One workaround marked
+   each store-to-load seam with a branch to the next line: the label is a
    basic-block boundary vcl cannot schedule across, and its late peephole erases
-   the branch so the fence is free — and invisible, so verify by store/load
-   order in the disassembly, not by looking for the label.
+the branch. This is a scheduler boundary, not a physical VU hazard fence.
+   Verify final store/load order, branch targets and store-to-XGKICK latency
+   in the generated image; labels and assembler exit status are insufficient.
+
 2. **vcl "regenerates" MAC flags with ABS, which sets no flags.** Never use
    `fmand` for a new sign test; when the scheduler separates producer and
    consumer it inserts a flag-inert ABS and the test silently reads stale flags.
@@ -1738,44 +1759,38 @@ pipes).*
 
 ### The output cap is an input contract
 
-A clipping microcode's output buffer is finite, and ours guards it the honest
-way: when a clipped fan will not fit under the per-buffer cap (`kCCapVerts =
-39`), the fan is dropped and the buffer's remaining triangles with it — better
-a missing triangle than a compound packet overrunning into the next buffer
-half's header and wedging the GIF. That policy is sound *for the workload the
-cap was budgeted against*: wall quads arrive mostly inside (8 tris = 24 verts),
-and a clipped one adds two or three.
+A clipping microcode's output capacity is part of its input contract. The
+original renderer guarded a 39-vertex cap by dropping an overflowing fan and
+the remaining input. This prevented overwrite but lost valid geometry: rejected
+behavior, not a lossless fallback. Typical wall counts did not prove a
+bound on every clipped batch.
 
 It is structurally unsound for giant polygons, and it fails silently. A
 screen-covering triangle straddles three or four frustum planes at once, clips
 to a 5-7 vertex polygon, and fans back out as 9-15 vertices; a few of those
 sharing one 8-triangle input buffer sail past the cap, and whole fans vanish.
 The symptom on hardware is huge missing triangles that come and go with camera
-position — whichever triangles happen to share a buffer decide the frame. In
-HyperSolar this surfaced as vanishing ground over Central Park, the one place
-the camera flies inside giant land-platform polygons with nothing drawn over
-them.
+position — whichever triangles happen to share a buffer decide the frame. In one scene this appeared as vanishing ground where no overlapping geometry
+concealed missing fans.
 
 Three durable conclusions. First, the cap is part of the renderer's interface:
 a stream whose primitives can individually fan past the remaining budget must
 not ride that renderer, however rare the overflow — "rare" is exactly what
-"missing at times" looks like. Second, big-polygon streams belong on a
-pre-clipping path (EE Sutherland-Hodgman): every batched triangle then arrives
-fully inside, expansion is zero by construction, and such streams are tiny
-anyway (the land platform is 24-156 vertices). Third, a silent-by-design drop
+"missing at times" looks like. Second, EE pre-clipping can bound the VU input for a small exceptional stream:
+every submitted triangle arrives inside the same clipping volume, eliminating
+further expansion. Its preparation cost must still be measured. Third, a silent-by-design drop
 deserves a counter — two guards whose only observable output is a missing
 wedge cost a hardware session to localize; a dropped-fan count in the log
-names the failure in one run. A practical forensic shortcut fell out too:
-runtime mode toggles that reroute the *same* geometry through different
-renderers (our SELECT X2/GS/EE cycle) convict the microcode with zero builds —
-holes in X2 that vanish in GS/EE cannot be the geometry builder's fault.
+names the failure in one run. Rerouting identical geometry through independent renderers is a useful
+diagnostic: holes that disappear under another clipping path localize the
+failure more strongly than a screenshot of the failing path alone.
 
 ### Refinement: preserve the input batch and spill output inside VU1
 
-The Central Park fix made a reasonable but incomplete generalization: giant polygons belong on
-the EE pre-clipper, while ordinary wall quads satisfy X2's 39-vertex output budget. A later frozen
-camera A/B disproved the second half. One fat building wall lost a triangle in X2 and X2D but not
-in GS or EE mode. Even small input primitives can expand into an unsafe *batch* when near and side
+Pre-clipping a large ground stream did not establish that ordinary wall quads
+fit a 39-vertex output budget. A later frozen-camera A/B found a wall triangle
+missing in the custom compound renderer and its compact-input variant but
+present with independent clipping paths. Even small input primitives can expand into an unsafe *batch* when near and side
 planes intersect them together.
 
 Splitting correctly before DMA repaired the triangle and regressed the frame. Conservative and
@@ -1797,32 +1812,36 @@ qwords. Two arenas therefore obey:
 A=30 and B=18 use the region exactly. A triangle clipped by five convex planes becomes at most an
 eight-vertex polygon (`3 + 5`) and a six-triangle fan, or 18 output vertices, so the smaller arena
 always fits one whole fan. When the current arena lacks room, VU1 closes and `XGKICK`s it, continues
-in the other arena, and alternates after the next kick. Alternation is the ownership rule: do not
-overwrite a packet PATH1 may still be consuming. The ordinary eight-triangle/24-vertex batch fits A
+in the other arena, and alternates after the next kick. Arena reuse must preserve
+PATH1/XGKICK consumption ordering. Alternation alone is no general completion
+proof; never overwrite a packet still being consumed. The ordinary eight-triangle/24-vertex batch fits A
 and keeps its original one-activation, one-compound-kick path.
 
 Do not hold arena address/capacity in integer registers across a five-plane S-H clipper; VCL ran out
 of VI registers. Reconstruct the current tag only at a spill point from
 `next_output - 3*out_count - 1`. After regeneration, verify generated store/load and kick order,
-the exact-image hash, decoder relocation, and combined micro-memory budget. The hardware-green
-image is X2 810 instructions plus the unchanged 56-instruction X2D decoder at PC810, tail-calling
-X2 PC6 (866/2048 total).
+the exact-image hash, decoder relocation, and combined micro-memory budget. For scale, the tested compound clipper occupied 810 instructions and its
+compact-input decoder another 56, starting at PC810 and tail-calling PC6:
+866 of VU1's 2048 instruction slots. These addresses describe that image, not
+stable entry points for another renderer.
 
 Hardware validation repaired the frozen wall angle and held every steady-state 10-second window at
 60.0 fps through a 190-second idle traversal. The dense windows remained at sync 1.73-1.74 ms with
-roughly ten thousand vertices per frame. Keep giant land on its already-proven EE route: a new
-capacity mechanism is not permission to broaden a renderer lane without a measured reason.
+roughly ten thousand vertices per frame. These historical window averages do not prove every-frame completion.
+Requalify exceptional streams before moving them to another renderer: output
+capacity alone does not establish parity or a performance benefit.
 
-## Chapter 23 - Measuring the Wall, and Kicking Twice
+## Chapter 23 - Separating Preparation Cost from Submission Cost
 
 Relevant manuals: GS User's Manual Ch 3 (drawing function, per-primitive `ABE`,
 `ALPHA_1`) and Ch 4 (image data transmission — the GIF packet formats each kick
 emits); EE User's Manual (DMAC/VIF/GIF paths) for what a "flush" actually costs.
 
-Chapter 22 moved clipping off the EE and into VU1 microcode. The city got faster,
-but not fast enough, and the natural next move — offload *more* — turned out to be
-the wrong instinct. What the frame needed first was not another optimization but a
-measurement precise enough to say which side of the pipeline was starving.
+Moving work to VU1 helps only if it removes the bottleneck. A PS2 draw path
+contains EE preparation, packet construction, DMA/VIF transport, VU execution
+and GS work, with overlap and waits between them. Instrument boundaries before
+choosing the next offload. The following two-material facade example shows how
+measurement can expose duplicated work.
 
 ### Two counters, one question
 
@@ -1832,17 +1851,19 @@ VU1 looks exactly like a pass that spends them in EE arithmetic. The distinction
 matters enormously, because the two have opposite cures.
 
 The fix is a second counter wrapped around the single choke point every batched
-draw exits through — `glDrawArrays`. Accumulate the time spent inside it, plus the
-draw and vertex counts, and report both counters together. Now the frame splits:
-time inside `glDrawArrays` is downstream (chain building, VIF1 bandwidth, VU1, GS);
-the pass total minus that is the EE's own vertex loops — transform, clip, the
-cache-cold walk over the geometry stream, and the write-combining copy into DMA
-scratch.
+draw exits through - `glDrawArrays`. Accumulate time inside the call and its
+draw/vertex counts. This is EE wall time in submission, including construction
+and waits reached there, not a direct GPU execution timer. Remaining pass time
+includes preparation, wrappers and state work. Count custom paths as well as
+generic DrawLinearArrays. Completion, queue-ready and presentation records
+supply separate evidence, not an exactly additive ledger.
 
-For HyperSolar's city, mid-flight, the answer was roughly four milliseconds inside
-`glDrawArrays` against eight in the EE loops, at about ten thousand vertices. That
+In that historical city workload, roughly four milliseconds were measured
+inside `glDrawArrays` against eight elsewhere in the pass, at about ten
+thousand vertices. Source inspection attributed much of that residual to
+EE preparation and memory traffic. That
 is on the order of **280 EE cycles per vertex** — an order of magnitude more than
-the arithmetic in those loops can account for. The wall was never clip math. It was
+the arithmetic in those loops can account for. The measured bottleneck in that experiment was attributed primarily to
 memory traffic: reading vertices that had fallen out of cache, and writing them
 again into uncached DMA memory.
 
@@ -1850,12 +1871,12 @@ Two consequences followed immediately, and both were unwelcome.
 
 First, a chunked display-list design — compile static slabs of the city once, call
 them per frame, let VU1 do everything — was not merely difficult on this fork; it
-was pointless. It removed arithmetic and left the per-vertex read and copy exactly
+did not remove the measured bottleneck. It removed arithmetic and left the per-vertex read and copy exactly
 where they were. (It was also structurally impossible: ps2gl's list manager is a
 bump allocator that wraps at four thousand IDs and asserts on collision, each list
 lazily claims four 256 KB DMA buffers, frees defer a frame, and colors and texture
-binds bake at compile time. Display lists are for install-once rigid models. A
-streaming, tinted, alpha-animated world is not that.)
+binds bake at compile time. These properties favor stable, reusable geometry. A
+streaming or frequently retinted scene needs another lifetime and state strategy.)
 
 Second, a "raw submit" fast path — skip the clipper, copy vertices straight into
 scratch — was measured and moved nothing, for the same reason. Both experiments
@@ -1900,10 +1921,11 @@ A **sentinel disables the second kick**: writing `-1.0` into the window color sl
 turns the renderer into a wall-only path, so one renderer serves both the combined
 draw and any single-textured per-vertex-colored draw. Cheaper than two renderers.
 
-The flush must be **synchronous**. ps2gl defers geometry to the next state change,
-while this renderer captures both textures at flush time. A deferred flush
-therefore executes with the *next* draw's bindings, and the city flickers building
-by building. Flushing immediately pins the capture to the state that produced it.
+Drain pending geometry construction while it owns its textures and admission
+state. Deferred construction reads these bindings; teardown first can construct
+old geometry under the next draw's state. `glFlush` commits construction here:
+it neither sends normal frame DMA nor waits for VU/GS completion. Referenced
+storage survives until that later boundary.
 
 And afterwards, dirty ps2gl's blend cache: the window kicks program `ALPHA_1`
 behind the library's back, so the next blended draw must resend its own function or
@@ -1929,30 +1951,31 @@ sees a cone.
 The remedy is cheap and belongs on the EE, because the eye coordinates it needs have
 already been computed by the transform: build a five-plane outcode per vertex, AND
 the three outcodes of a triangle, and drop the triangle when the result is non-zero —
-all three vertices outside the same plane means it can never be visible. One subtlety
-decides correctness: a vertex behind the near plane must contribute **only** the near
-bit. Its lateral position is meaningless once `z <= 0`, and emitting side bits there
-will reject a triangle that straddles the near plane and is partly on screen.
+all three vertices outside the same plane means it can never be visible. For an outcode test derived from projected side bounds, a vertex behind the
+near plane contributes only the near bit. Applying those projected side tests
+behind the eye can reject a visible crossing triangle. This restriction does
+not replace correctly formulated homogeneous plane tests; preserve the
+conventions of the chosen representation.
 
 Clipping is VU1's job. Deciding whether geometry is worth sending is still the EE's.
 
 ### Discipline for the counters themselves
 
-Report per-frame averages over a **time** window, not a frame-count window. At
-variable frame rates a fixed frame count covers a different stretch of the world each
-time, and a single stage-load stall will dominate a short average. Ten seconds is a
-comfortable window.
+Choose aggregation windows to match the experiment. A fixed frame count spans
+different elapsed time at different frame rates; a fixed time window can span
+different scene content. Retain per-frame samples where possible and compare
+matched phases or routes. Isolate loading when measuring steady rendering,
+and include it explicitly when measuring transition latency.
 
 Tag every line with the configuration it describes, and **restart the window when the
 configuration changes**. An A/B toggle that leaves the accumulator running silently
 blends two configurations into one average and produces a confident, meaningless
 number.
 
-Finally: governor and LOD bands are calibrated against a *cost curve*, not against
-geometry. When the renderer gets faster the bands do not know it. After both upgrades
-in this chapter the city's autotune still sat pinned at its throttling floor, holding
-back detail the frame could now afford. Every time the pipeline changes, the tuning
-that was measured against the old pipeline becomes a lie.
+Adaptive LOD thresholds encode a measured cost curve. A faster submission path
+changes that curve. Recalibrate against the revised pipeline while preserving
+the visual policy; an old governor may keep removing affordable detail.
+
 ## Chapter 24 - The Heap Smasher: Forensics When the Crash Site Lies
 
 Relevant manuals: EE Core User's Manual Ch 4 (exception handling — reading `Cause`,
@@ -1975,7 +1998,7 @@ addr2line first) into `__malloc_update_mallinfo`, called from `_mallinfo_r`, wit
 walking its free list and stepped on a chunk header full of zeros.
 
 This is the single most important fact about the whole class: **the crash site is
-the first *reader* of the damage, never the writer.** The heap was corrupted
+a reader of earlier damage, not evidence that the allocator wrote it.** The heap was corrupted
 earlier — possibly minutes earlier — by code that has long since returned. Debugging
 `mallinfo` is debugging the coroner. The crash moving between builds, or appearing
 "when I press START" (the debug HUD's RAM row called `mallinfo()`), is the same
@@ -1983,8 +2006,8 @@ misdirection: the button did not break anything; it was merely the next reader.
 
 ### The tool: the walker itself, turned into a validator
 
-The function that crashes on a corrupt heap is, by that very property, a perfect
-detector for one. `mallinfo()` walks every chunk and faults on the first bad link —
+The function that crashes on a corrupt heap is, by that very property, a useful
+probe for this failure. `mallinfo()` walks allocator metadata and can fault on a bad link —
 so call it on purpose, everywhere, with one discipline: **print a label before the
 walk, and a second line after.** On a healthy heap you get `chk X` / `ok X` pairs;
 on a corrupt one the output ends at a `chk` whose `ok` never came, and that label
@@ -1999,15 +2022,12 @@ the first wall-only draw through the x2 renderer, 24 vertices of land platform.
 
 ### The false exit: padding that "fixed" it
 
-Mid-hunt, a 16-byte canary added past one large allocation made the crash
-unreproducible, and the tempting reading was Heisenbug — layout-sensitive, file it
-away. The correct reading is a classification: a *relative* overrun (code running
-off the end of its own buffer) moves together with its victim when the heap slides,
-so padding cannot hide it; only a write to an effectively **absolute** address — a
-stale pointer, a mis-built DMA tag, or a fixed-size overrun inside one specific
-heap object — goes quiet when everything shifts 16 bytes. The suppression was not
-noise. It was the bug stating its addressing class, and it pointed directly away
-from the padded buffer and toward some other heap object with a fixed layout.
+Mid-hunt, 16 bytes of padding made the crash disappear. That established
+layout sensitivity, not a repair or an addressing-class proof. Padding can
+change the victim, detection or timing of relative overruns as well as stale
+pointer writes. Keep the suppression as localization evidence, then identify
+the actual writer. Here the decisive evidence was the subsequent mismatch
+between the prefix array's capacity and its real transfer count.
 
 ### The writer: a staging array sized from a comment
 
@@ -2026,26 +2046,25 @@ pick the transfer call you can grep, never the prose.
 
 ### Rules this chapter adds
 
-An exception inside `malloc`/`free`/`mallinfo` means the heap died earlier,
-elsewhere; resolve `EPC` *and* `ra`, then hunt the writer, not the reader.
-`mallinfo()` is a drop-anywhere heap validator; label before the walk. A
+An allocator exception can expose earlier corruption: resolve `EPC` and `ra`,
+then distinguish the failing reader from the writer. `mallinfo()` is a useful
+metadata probe for this failure, not a complete heap verifier; label before it. A
 perturbation that suppresses a memory bug is a localization result. Custom
 renderers are heap objects — a member-array overrun is heap corruption. And
 scaffolding is scaffolding: the per-frame walk costs real EE time and leaves with
 the fix.
 
-## Chapter 25 - The Sixty Lock: One Kick, One Page, and the Flat Matrix
+## Chapter 25 - GS Context Reuse and Mipmap Page Locality
 
 Relevant manuals: GS User's Manual pp. 47-49 (the two register contexts and
 `PRIM.CTXT`), Ch 8.3/8.5 (block arrangement tables — the source of the packed-mip
 offset magic), and the trilinear/LOD sections the mip fix leans on.
 
-Chapter 23 ended with the double-kick renderer: transform the shared wall geometry
-once, kick the GS twice. This chapter is how the city went from "dips to 51 under
-load" to a combat-verified, locked 60 fps in 448p — and it is really two stories:
-an architecture the GS manual had been advertising all along (its second register
-context), and a texture-layout pathology that survived four hardware experiments
-precisely because none of them touched the one thing that mattered.
+Two costs can masquerade as a fill bottleneck: repeated texture-state
+synchronization and poor locality between sampled mip levels. The GS's two
+register contexts can reduce the first; format-aware packing can reduce the
+second. These experiments distinguish the mechanisms without treating a
+historical frame-rate plateau as a universal performance result.
 
 ### One compound kick: the second context is not decoration
 
@@ -2069,7 +2088,7 @@ renderer re-arms per pass; and the wall pass rides LIVE context-1 state, so
 whatever the old prefixes used to force (blend, alpha test) must now be pinned
 explicitly.
 
-### The land platform: four flat experiments and the page walk
+### Ground sampling: isolate depth, primitive shape and memory layout
 
 The remaining dips tracked the city's ground. A debug layer kill-switch priced it
 instantly — land off, 60 fps, every time — and then four serial hardware
@@ -2079,20 +2098,21 @@ the land beneath; reshape the primitives (32u slivers, 128u strips, giant fans);
 finally draw it with the depth unit fully off (ZMSK=1 + ZTST=ALWAYS — no Z read,
 no Z write). **All four were flat.** That flatness is the finding: depth outcome,
 draw order, primitive shape, and the whole Z unit eliminated, the cost follows
-exactly one variable — textured fragments rasterized. When every state-side
-experiment is flat, the cost is on the sampling side.
+the sampled-texture path in that experiment. These flat probes support
+a sampling-side hypothesis; they do not identify every VU/GIF/GS stall or
+prove a universal cost model.
 
 The sampling-side suspect: the land texture's mip levels each lived in their own
 GS page, and a grazing-angle ground plane keeps every pixel BETWEEN two LOD
 levels, so trilinear fetches two page-separated texels per pixel — a per-pixel
 page walk worth ~1.4-2.0 ms, roughly ten times the raw fill cost of the same
-pixels. A one-letter CSV test (mips off) jumped every immovable window to the
-ceiling — but note the audit correction: that removes the page reloads AND
-trilinear's inherent cost together, so it only localizes the path. The proof was
-the fix itself: pack the whole 64x64 pyramid into ONE page (identical texels,
+pixels. A mip-disable experiment jumped every immovable window to the
+ceiling — but note the confound: that removes the page reloads AND
+trilinear's inherent cost together, so it only localizes the path. The stronger comparison was pack the whole 64x64 pyramid into ONE page (identical texels,
 identical filtering, only the layout changed) and the windows locked at 60 with
-mips on. Scatter was the cost; trilinear is effectively free once both levels
-share a page.
+mips on. The layout improved that workload. It does not make trilinear free or prove
+every pyramid fits a page. Larger RGBA32 pyramids can require multiple pages and need separate layout
+and performance measurements.
 
 The packed path has its own contract: magic block-offset tables from the GS
 manual's block arrangement tables (PSMT8 packs L0-L3 in one page; PSMCT16 packs
@@ -2102,7 +2122,7 @@ re-allocation allowed to retarget TEX0 away from the pack — and scope discipli
 only the exact tested pyramid shape takes the packed path; everything else stays
 on the proven legacy allocator.
 
-### What did NOT work, so nobody rebuilds it
+### Negative results and their limits
 
 Front-to-back submission (no early-Z to feed — sorting cost with zero GS gain,
 measured worse than build order). Draw-order/Z-fail tricks on a fetch-bound
@@ -2115,185 +2135,641 @@ route, and any visual regression rejects the slot even when the numbers are flat
 
 ### Rules this chapter adds
 
-- Two materials intermixed = two GS contexts and one compound kick, not two kicks
-  and not state resends. Context 2 must be re-armed: glClear owns it once a frame.
+- Compatible two-material draws can use both GS contexts in one compound kick.
+  Account for other context users: the tested ps2gl `glClear` rewrites context 2,
+  so the custom pass must restore it.
 - Count TEXFLUSHes before blaming fill. Stalls scale with draws; fill with coverage.
-- Keep every mip pyramid page-local. Scattered levels turn trilinear into a
-  per-pixel page walk on any large grazing surface; pack the pyramid.
+- Improve mip locality within a proven format/owner layout. Not every pyramid
+  fits a page; locality alone proves no complete-frame speedup.
 - The flat matrix localizes invisible GS costs: vary depth outcome, order, shape,
-  and the Z unit one slot at a time — all flat means sampling-side.
-- A layer kill-switch prices a subsystem in one toggle; judge by the GS-wait delta
-  at matched windows. It is an upper bound: partial tricks may recover none of it.
-- Front-to-back is worthless on the GS. Submit less or sample cheaper; never sort.
+  and the Z unit one slot at a time. Flat probes support a sampling hypothesis
+  for that workload, not exclusive ownership of every stall.
+- A layer kill-switch measures the effect of omitting that layer in matched
+  windows. Overlap and cache changes prevent treating the delta as its isolated
+  cost or a guaranteed bound on another optimization.
+- The tested front-to-back candidate regressed. GS has no modern early-Z
+  justification for sorting; preserve order and measure any proposed change.
 - One change per hardware slot, signature declared before the run, and a visual
   regression rejects the slot regardless of the numbers.
 
+## Chapter 26 - Submission LOD, Texture Identity, and Semantic Vertex Channels
+
+### A performance radius must remove the second material
+
+Distance-fading a material to alpha zero is a visual policy, not a submission
+optimization. The EE still transforms the vertices, DMA still transports them,
+the VU/GS still receives the primitive, and texture/blend work still exists.
+When the purpose of a radius is performance, the material must disappear from
+the command stream.
+
+For example, keep an opaque facade shell to the main visibility limit while
+restricting an emissive overlay to a shorter distance. Intersect visible base
+spans with admitted overlay ranges, then submit wall-only gaps and compound
+intersections. The wall-only path must emit no overlay primitives. A transition
+may fade the overlay near admission, but excluded ranges should omit its
+submission entirely.
+
+The reusable rule is simple: inspect the submitted kicks or primitives. If an
+"invisible" material still arrives at the GS, the LOD did not save its work.
+
+### Shared glTF images are one upload and many aliases
+
+Several glTF materials may reference one `cgltf_image`. Uploading from each
+material independently creates pixel-identical GS residents. When the loader
+does not apply distinct sampler objects, source-image identity is the complete
+upload identity: search earlier materials for the same image, reuse their
+`Texture2D` handle, and decode/upload only on the first occurrence.
+
+That turns the material texture slots into aliases. Deep model teardown must
+deduplicate by runtime texture id, release each handle once, and clear every
+alias before destroying the material arrays. In short, source-image identity
+controls upload and handle identity controls unload; filenames control neither.
+
+Test reset/teardown and sampler differences explicitly. Identical source
+images do not justify sharing when conversion or sampler requirements produce
+different runtime resources.
+
+### Each shared vertex lane gets one semantic owner
+
+Custom VU1 paths often repurpose a convenient input component, but the public
+renderer contract must state what that component means. For example, input wall alpha may carry a fog keep coefficient packed into
+`XYZF2.F`. That lane then represents fog, not ordinary wall opacity.
+
+If the material specification calls for an unfogged emissive overlay, its kick
+must be independent of both that alpha lane and wall fog enable. It uses a constant contribution through
+`ALPHA.FIX`, and its giftag clears `PRIM.FGE`. Letting the second material
+inherit wall alpha or FGE would silently couple haze policy to window brightness
+and can tint additive content with the fog color. Another material may
+intentionally share fog; make that choice explicit.
+
+Treat position fog, material opacity, transition alpha and additive strength as
+separate meanings even if an implementation temporarily packs one into a shared
+word. Every material kick opts into only the channels it owns.
+
+### Translate a global mip distance into signed S7.4 LODK
+
+GS `TEX1.K` is logarithmic signed S7.4 bias. A global distance multiplier must
+preserve each texture's authored baseline by adding:
+
+```text
+delta_K = -16 * log2(distance_scale)
+```
+
+Round once, add it to the asset's existing `LODK`, clamp to the signed 12-bit
+range, and touch only textures with mip levels. A scale below 1 selects coarser
+mips sooner/closer; above 1 holds finer levels farther away. Do not replace all
+asset K values with one global constant: ocean, facades and other families retain
+different aliasing requirements, and S7.4 quantization makes nearby UI values
+hardware-identical anyway.
+
+## Chapter 27 - Split Immutable Models at the Dynamic Material Boundary
+
+ps2gl display lists capture geometry, texture and material state when they are
+compiled. A live tint cannot be pushed through an immutable whole-model list
+without either recompiling it or silently drawing the old captured color.
+
+Install the model by mutability instead. Compile the stable body once, identify
+the smallest tintable material/submesh once at load time, and retain that piece
+as an explicitly parameterized draw. HyperSolar's F22 uses this split for a
+single 32x32 grayscale exhaust mask: shared code precomputes static/live hue and
+brightness variants, while the PS2 path applies the cached tint to the small
+exhaust draw without searching the model or rebuilding its body list.
+
+The general rule is: immutable work stays immutable; dynamic material islands
+stay small and explicit. In this example only 16 unique exhaust vertices need
+runtime lighting before the cached tint is applied; the body list is reusable.
+ps2gl already normalizes runtime color to the GS scale, so
+another blanket 128/255 correction was not the solution.
+
+The first attempt required `mesh.colors`, but the loaded glTF primitive had no
+`COLOR_0` and the PS2 loader allocated no color array; the effect vanished.
+Draw-local colors fixed that assumption. A later attempt reset shared frame
+scratch and damaged pending skybox geometry. The repair appends normally
+through the existing copied draw path, as Chapter 9 explains. Validate the dynamic piece, the unchanged body and scratch lifetime separately.
+Correct tint alone does not establish complete lighting parity or performance.
+
+## Chapter 28 - Audio Ring Geometry Is a Wire ABI
+
+An IOP streamer's chunk size simultaneously defines its encoded-file stride,
+DMA read size, SPU2 half-ring size, total per-channel ring size, latency and
+legal address range. Tuning one constant in isolation can overwrite a neighbor,
+replay a stale half or alias channel storage even when the individual transfer
+looks valid.
+
+For a concrete layout, choose 1024 PS-ADPCM blocks per chunk. At 16 bytes per
+block each channel half is 16 KiB and its two-half ring is 32 KiB. Two rings can
+occupy `0x1F0000` and `0x1F8000` if the SPU2 allocator reserves those ranges.
+These are example addresses, not mandatory streaming locations. Encoder stride,
+IOP transfer length, ring addresses, loop flags and allocation map must agree.
+Derive shared constants where possible, audit every boundary after a change,
+and validate playback and refill deadlines on the target.
+
+### Deploy the format, not just the executable
+
+The chunk size is also a contract with files already on removable media.
+Raw PS-ADPCM has no header declaring the interleave. A 2048-block channel chunk
+read by a 1024-block streamer is split between the two outputs: left receives
+the first passage, right receives the following passage. At 28 samples per
+block and 48 kHz, the offset is `1024 * 28 / 48000 = 0.597333` seconds. It sounds
+like the song was started twice even though both voices are keyed together.
+
+A real occurrence of this symptom disappeared when removable-media files were
+replaced with music encoded using the revised chunk geometry. Rebuilding the
+executable could not replace those files. Check deployed bytes and encoder
+settings before changing voice-start scheduling: a format mismatch can sound
+like a synchronization bug.
+
+Build dependencies also matter. If a make prerequisite list expands a track
+variable before that variable is defined, the normal build can omit music even
+though a later target includes it. Attach dependencies after their inputs are
+defined, and verify generation and deployment as separate steps.
+
+Halving a 2048-block chunk to this 1024-block example reduces stereo ring
+storage from 128 KiB to 64 KiB but also halves refill headroom. Correct playback
+of a track does not establish worst-case refill margin. Measure under the
+intended storage latency and IOP workload before adopting a smaller ring as a
+general memory optimization.
+
+## Chapter 29 - What Each Kind of Validation Can Prove
+
+A PS2 renderer crosses compiler, cache, DMA, VU and GS boundaries. A test
+that observes one boundary cannot certify all the others. State what was
+tested and preserve the executable, settings and input that produced the
+result; a later source tree is a different candidate.
+
+A host numerical model can check a matrix formula, packed address calculation
+or capacity bound. It cannot establish that the compiler preserved an aliasing
+trick, the EE published dirty cache lines, or the GS rasterized two clipped
+planes identically. Conversely, one correct image cannot prove a capacity
+bound or rule out a delayed source-lifetime failure.
+
+### Build an evidence chain
+
+Use the cheapest relevant check first, then test the boundaries it cannot
+represent. For a new VU primitive, that might mean:
+
+1. A host model for input/output bounds and attribute interpolation.
+2. Inspection of the generated instructions and packet layout.
+3. A standalone checkerboard test with near/side crossings and full buffers.
+4. Integration with real state transitions and asynchronous source lifetimes.
+5. Hardware comparison in representative views and display modes.
+
+A successful build establishes toolchain integration, not rendering
+correctness. An emulator can expose exceptions and packet errors while hiding
+display timing or texture-precision behavior. Real hardware remains necessary,
+but its result is still scoped to the workload and configuration exercised.
+
+### Keep different claims separate
+
+Correct pixels, lower EE preparation time, earlier GPU completion and steadier
+presentation are different outcomes. A change can improve one and regress
+another. Identify the expected effect before measuring, and reject any claim
+that relies on a counter whose population or coverage changed.
+
+Long runs test failure modes short captures miss: origin drift, exhausted
+counters, stale descriptors, reset ownership and slow leaks. They complement
+focused boundary tests rather than replace them. Keep failed hypotheses with
+their evidence so that a plausible but already-disproved explanation does not
+become the next debugging plan.
+
+The practical rule is simple: each result should say which implementation ran,
+what it observed, and what remains outside that observation. No project
+milestone or average frame rate substitutes for that information.
+
+## Chapter 30 - Construction, Publication, and Completion
+
+Relevant manuals: EE User's Manual for DMAC/GIF/VIF; EE Core User's Manual
+for cache visibility; VU User's Manual for VU memory and PATH1 consumption.
+
+A deferred draw has three separate boundaries. Geometry must be constructed
+while its renderer and material state are valid. Packets and external REF
+sources must be published with the required cache writeback. Referenced bytes
+must then stay immutable until the consuming transfer or processor completes.
+A state flush may establish only the first boundary; elapsed time establishes
+none of them.
+
+### Drain the old draw before tearing down its state
+
+If a renderer reads live qualification flags when it constructs a packet,
+clearing those flags first can route old geometry through the wrong program.
+Drain pending construction under the old bindings before changing renderer or
+ending the material scope. Know whether an API named "flush" constructs work,
+submits it, or waits for it; those operations are not interchangeable.
+
+Append-only frame scratch is a simple way to preserve pending references.
+Resetting a cursor inside a material helper can overwrite an earlier draw.
+Saving and restoring the cursor does not restore overwritten bytes.
+Reserve all storage before publishing a transactional draw; if a prefix has
+already escaped, a fallback must continue after it instead of replaying it.
+
+Retained caches need publication identity as well as pointer identity.
+A frequently rebuilt array can be safely borrowed if it stays immutable
+through consumption. A static pointer is unsafe if its contents change while
+DMA still owns them. Flushing the command packet does not publish dirty
+external REF payloads automatically.
+
+### Presentation is another ownership transfer
+
+Rendering completion, a serviced vblank and scanout ownership are distinct.
+A queued vblank event proves an edge occurred, not that blanking is active
+when the CPU later handles it. A GS SIGNAL marker and raster FINISH have
+different semantics. Design the swap policy around the actual completion
+event and display ownership, not the names of wrapper functions.
+
+Double buffering is a storage arrangement, not a completion proof. Reuse a
+buffer only after its previous consumers have retired. The same rule applies
+to an EE/IOP RPC: a timeout may report failed progress, but it cannot permit
+overwriting a live request or issuing another transaction into the same client.
+
+For queued IOP services, distinguish admission from execution. A reply that
+acknowledges an owned command copy can release the sender's source; it does
+not necessarily mean the worker has executed the command. Make both meanings
+explicit in the protocol.
+
+## Chapter 31 - Compact Geometry Without Changing Its Meaning
+
+Compact inputs can reduce EE memory traffic and VIF transfer work. They are
+useful only if the consumer reconstructs the required geometry, attributes,
+draw order and lifetime. A screen-space rectangle, clipped world quad and
+perspective decal are not interchangeable simply because each has four corners.
+
+Preserve the original triangle diagonal. For example, a strip ordered
+0,1,3,2 corresponds to triangles 013/132; substituting the other diagonal can
+change color interpolation, texture gradients and coplanar depth. Share a
+center or basis only when the producer's arithmetic and clipping contract
+permit that reconstruction.
+
+Near/side clipping must interpolate the consumer's actual UV, color and fog
+meanings. Unsupported inputs need an explicit fallback before any partial
+submission escapes. A center/radius rejection is not proof that a visible
+corner can be dropped or that a long beam qualifies as a small billboard.
+
+### Share preparation, not incompatible state
+
+Stable parent transforms or visibility facts may serve several materials.
+That does not make their draws mergeable: texture, depth, blend, clipping
+and source lifetime must agree. Preserve the required base/overlay order even
+when a single preparation loop creates both outputs.
+
+A specialized ordinary path and a cold exceptional adapter can share a VU
+program and bounded staging. Admit only the proven numerical domain; do not
+weaken a depth tolerance or discard rare geometry to increase fast-path use.
+Measure fallback frequency as well as the cost of the common path.
+
+For HUD batching, retain logical order, glyph placement, unsupported-character
+advance and empty-string behavior. Keep animation clocks and RNG calls with
+their update owner. Capacity drains should end at complete prefixes, and
+descriptor sources must survive until consumed. Sorting overlapping UI by
+texture is not equivalent to batching adjacent compatible draws.
+
+### Bound coordinates in the frame where they are used
+
+A periodic or origin-rebased world can keep player coordinates small while a
+retained render origin drifts far from the camera. Subtracting the same period
+from both does not reduce their difference. What matters to the transform is
+the size of the operands and their relative displacement.
+
+Recenter retained local data as one publication transaction: update complete
+dependent spans in an inactive bank, preserve absolute simulation identities,
+and invalidate caches tied to the old origin. Publish only once all consumers
+agree on the new frame. This limits cancellation and fixed-point range problems
+without moving the represented world. Test boundary crossings and long runs;
+a short stationary image cannot exercise accumulated origin drift.
+
+## Chapter 32 - Emitted Code and Cache Dependencies
+
+Relevant manuals: EE Core User's Manual and Instruction Set Manual for
+generated EE code; VU User's Manual for scheduled execution and hazards.
+
+Source expressions, byte models and successful assembly are different
+witnesses. None alone proves what optimized EE code or a scheduled VU program
+will execute.
+
+### Packet writes need a valid language representation
+
+In one GIF-tag bug, an optimized packet advertised fifteen A+D records while
+sending two: a type-punning store intended to change the count disappeared
+under optimization. Casting storage to an unrelated struct pointer does not
+establish a valid object of that type.
+
+Use typed packet operations or representation copies supported by the
+language. Then compare tag counts with the actual DIRECT payload and inspect
+the generated code where necessary. A host model that manually writes the
+intended bytes cannot reproduce a store the compiler removed.
+
+A source simplification can also introduce helper calls, spills or byte copies.
+Inspect emitted EE code before assuming fewer expressions mean fewer cycles.
+Specialize a proven finite input domain where useful, but retain out-of-domain
+behavior, signed zero where relevant, arithmetic order and wide capacity checks.
+
+### Inspect the final VU image
+
+Check branch targets, delay slots, integer/vector dependencies, Q/ACC timing,
+store/load ordering and store-to-XGKICK hazards after scheduling. Include
+decoder relocation and the combined instruction/data-memory budget.
+A compiler scheduling barrier is not necessarily a physical hardware fence.
+
+Test clipped output expansion and buffer transitions as well as ordinary
+vertices. A standalone program can validate the mechanism without reproducing
+integrated material admission, source lifetime or complete-frame cost.
+Numerical agreement and a performance improvement require separate evidence.
+
+### Cache keys describe dependencies
+
+A sparse VU context writer must preserve the consumer's addresses and
+invalidate on unknown state, program changes and resets. GS environment
+dirtiness and retained VU context are separate. A transform-only unlit proof
+does not establish correctness for normal or light data.
+
+A combined-matrix cache, for example, depends on projection, modelview and
+the GS raster scale. Key every relevant input or use a generation scheme that
+tracks all of them. Bit-identical reuse is a stronger guarantee than an
+epsilon comparison that silently changes output.
+
+Retained texture-slot iterators can remove searches if eviction order,
+validity and ownership survive splices, deletion and reset. Measure changes
+independently to distinguish their contributions.
+
+## Chapter 33 - Mip Layout, Dither, and Depth
+
+Relevant manuals: GS User's Manual for local-memory block geometry, TEX1,
+MIPTBP, CLAMP, TEST and dithering; GS Supplement for texture-page-buffer
+behavior. Address locality, sampled texels and complete-frame cost are
+different properties.
+
+### Isolate atlas cells at every level
+
+A correct base atlas can bleed at smaller mip levels. Preserve each material's
+coverage or energy filter and exclude neighboring cells from every sampling
+footprint. Check sampler strides, resident ownership and teardown too.
+
+A custom PATH1 renderer can emit a cell-specific CLAMP with each compact
+record, avoiding an EE material split for every cell. Preserve source STQ,
+draw order and the actual sampler bounds. Compare the extra GS state traffic
+against the EE work saved; fewer draw calls alone prove no gain.
+
+Check packed block addresses and strides for the chosen PSM. Not every pyramid
+fits one page. Reduced address scatter alone proves no speedup: compare
+completion cost at matched camera views and workloads.
+
+### Zero-alpha blending can still write a different RGB16 value
+
+A blend equation may return the stored destination RGB for source alpha zero.
+Writing that value through RGB16 dithering can nevertheless subtract another
+quantization step. Avoid the unwanted color store without accidentally
+suppressing an intended depth update.
+
+For an admitted source-alpha blend, an emitted alpha test can reject zero
+alpha and use ZB_ONLY on failure to preserve the original depth behavior.
+A KEEP failure action is a different optimization: it also discards depth,
+so it needs depth writes disabled and a compatible destination-alpha contract.
+Explicit alpha tests, destination-alpha tests and other blend equations must
+retain their own semantics.
+
+Copy temporary TEST settings into packet-owned storage before restoring
+logical state. Test transparent texels in the actual framebuffer format,
+with dithering enabled and disabled; qualify every admitted blend mode.
+
+### Work in the active raster units
+
+Layer ordering and decal tolerance solve different problems. In a Z16 buffer,
+small relative depth tiers can quantize to the same value. Identical world
+planes can also produce different raster planes after clipping and XY/Z
+quantization. Use the active projection, raster scale and depth format when
+calculating a tolerance; preserve perspective STQ and decide which surface
+owns depth for subsequent draws.
+
+If several layers intentionally form one background, composing their color
+before publishing the background depth can avoid unnecessary coplanar tests.
+That is a pass-order contract, not permission to disable depth globally or
+offset geometry until an artifact disappears.
+
+## Chapter 34 - Alignment Is Part of the Asset Format
+
+Relevant manuals: EE Core Instruction Set Manual for memory-access alignment;
+EE User's Manual for DMA transfer units and source addresses.
+
+An embedded payload is not aligned merely because its containing symbol is
+aligned. The address a consumer uses is the sum of the container base and
+every enclosing offset. The format must preserve alignment at each boundary.
+
+For a consumer requiring alignment A, check:
+
+```text
+(container_address + payload_offset + element_offset) % A == 0
+```
+
+Use the requirement of the actual operation. Ordinary typed loads and DMA
+transfers need not have the same alignment. A layout safe for byte parsing
+can fault when reused as an in-place int16 array; a CPU-readable buffer can
+still violate a qword DMA contract.
+
+### Padding belongs in the producer and the format
+
+Round each payload start up to its required boundary, initialize the padding
+and record the padded offset in the format. Align the final embedded object
+as well. Use checked arithmetic for offset-plus-length calculations and reject
+out-of-range or misaligned sections before exposing typed pointers.
+
+Validate the absolute address when the loader accepts arbitrary caller-owned
+buffers. Relative section checks alone are sufficient only if the outer
+buffer's alignment is already guaranteed. Where a format deliberately permits
+unaligned data, decode through byte-safe operations into aligned storage rather
+than casting it to a stricter type.
+
+A HyperSolar asset incident illustrates the boundary: internal section offsets
+were aligned, but a changed content size placed the entire appended section
+at an odd address. In-place halfword loads on the EE faulted. Padding the outer
+section and validating its recorded offset repaired the contract; relying on
+the previous content size being even had never been safe.
+
+### Repacking and embedding must agree
+
+A repacker must distinguish the original payload from a previously appended
+section; otherwise repeated runs can accumulate padding or duplicate data.
+Keep version, sizes and offsets together and validate them before reuse.
+
+The generated binary and any generated C tables describing it are one ABI.
+Make the consumer depend on the producer's real inputs and completion output.
+Missing sibling outputs or a stale stamp must not leave a newly linked ELF
+using mismatched metadata. A successful link proves symbols resolved, not
+that the bytes embedded in them match their parser.
+
+For DMA-fed texture data, apply alignment to every blob, including those after
+size words or other small fields. A single alignment directive at the start of
+an assembly file does not align all subsequent objects.
+
+## Chapter 35 - Profile the Pipeline Without Measuring the Instrument
+
+Relevant manuals: EE Core User's Manual for counters and exceptions; EE User's
+Manual for timers, DMA and interrupt behavior. Counter semantics matter as
+much as counter resolution.
+
+### Start with the phase you intend to optimize
+
+A PC histogram that includes loading can make a one-time builder look like a
+per-frame hotspot. Reset or re-arm collection at the intended phase and label
+transitions. Resolve samples against the matching unstripped ELF, including
+inline information when available.
+
+Check bucket boundaries before assigning cost to a function. A 64-byte bucket,
+for example, can straddle a function entry and charge work to its neighbor.
+Use instruction/line information and callers to interpret it, rather than
+choosing an optimization from the hottest symbol label alone.
+
+Window averages can hide sustained dense segments. Add bounded per-frame
+records around missed budgets, using the same phase definitions as normal
+reports. Keep nested scopes nested: their times are not independent amounts
+to add together. Independent maxima likewise do not describe one real frame.
+
+### Separate preparation, completion and presentation
+
+EE time inside a draw call includes packet construction and any waits reached
+there. It is not a direct VU or GS execution timer. Measure completion and
+queue-ready boundaries separately, then correlate them with presentation.
+If the frame is queued promptly but finishes late, that narrows the problem;
+it does not by itself distinguish VU execution, GIF transfer and GS work.
+
+Keep camera route, geometry, layers, display mode and instrumentation fixed
+for an isolated comparison. Changing content density changes the workload even
+on the same route. Short comparisons can test a bounded candidate; long runs
+address drift and rare failures. Neither a high mean FPS nor zero repeats in
+one run establishes a universal frame-time ceiling.
+
+### Telemetry has ownership and cost
+
+Formatting and output can perturb the frame being measured. Capture compact
+records into bounded owned storage, then format or decode away from the hot
+path where practical. Keep schema identity and argument widths explicit when
+moving decoding to the host.
+
+An asynchronous EE/IOP transport must retain request/reply storage until the
+RPC completes, distinguish queue admission from output completion, and report
+backpressure. A UDP send accepted by the local stack does not prove host
+receipt. Sequence numbers and drop counters help distinguish missing data
+from absent work.
+
+Use configurable collection scopes and record which ones were enabled.
+Missing records from a disabled collector mean unknown, not zero. Include
+collector and reporting cost in whole-frame comparisons, and verify a repair
+without the timing perturbation that first made the problem disappear.
+
 ## Appendix A - Quick Rules
 
-- Standalone boot: reset IOP, wait sync, re-init SIF RPC, apply SBV patches,
-  then load buffer IRX modules.
-- ps2link success is not standalone success.
-- Use GS color breadcrumbs when `printf` is unavailable.
-- Keep the PS2 backend as a backend library. No scene ownership, no direct game
-  state reads, no hardcoded asset filenames.
-- Avoid libgraph on top of ps2gl.
-- Use 448p, not 480p, for the real progressive layout.
-- Align framebuffer height to GS page rows.
-- Pair 16-bit color with 16-bit Z; pair 32-bit color with 24-bit Z.
-- DTV progressive needs the correct display magnification.
-- Re-zero GS BGCOLOR every frame and before long mid-frame stalls.
-- A crash inside `malloc`/`mallinfo` names the victim, not the writer — the heap
-  died earlier, elsewhere. `mallinfo()` itself is a drop-anywhere heap validator;
-  print the label BEFORE the walk.
-- Size VU1 staging arrays from the transfer count, never from a comment.
-- Padding an allocation and the bug vanishing is a localization result (absolute-
-  address write), not a Heisenbug.
-- Batch by state. State changes beat vertex count as the usual cost center.
-- Keep one uniform color per batch, or bucket by quantized color.
-- Never emit empty `rlBegin`/`rlEnd` batches.
-- Treat the slot after `EndDrawing()` as off-limits for raylib/GS calls.
-- Do not use `%f` in hot PS2 HUD/debug formatting.
-- For always-on-top overlays, use `glDepthFunc(GL_ALWAYS)`, not only
-  `glDisable(GL_DEPTH_TEST)`.
-- Alpha-blended PS2 geometry that must fade should be textured, even if the
-  texture is a 1x1 white pixel.
-- Custom world-space geometry goes through the software clipper or a proven
-  display-list path, not raw world-space `glBegin`.
-- PGL clipping on for raw display lists unless a bounding-sphere test proves a
-  safe bypass; PGL clipping off for software-clipped meshes.
-- Keep UV magnitudes small on GS hardware.
-- Use PSMT8 for most art; reserve CLUT slots and align blobs to 16 bytes.
-- Put `MIPTBP` in each texture's settings packet, not a global write, and any
-  number of mipmapped textures coexist. Deep-release mipped textures before a
-  VRAM-layout switch (levels are sampled, never bound, so they do not self-heal).
-- Enable 16-bit framebuffer dither through the ps2gl drawenv object.
-- Use `mallinfo()` for EE memory and a forked ps2stuff query for live GS memory.
-- For GS memory, track largest free slot, not only total free pages.
-- Intermixed materials: two GS contexts, one compound kick. Re-arm context 2 —
-  glClear stomps it every frame.
-- Count TEXFLUSHes before blaming fill (stalls scale with draws, fill with coverage).
-- Keep mip pyramids page-local; scattered levels make trilinear a per-pixel page walk.
-- When depth, order, shape, and the Z unit all measure flat, the cost is sampling-side.
-- Front-to-back submission is worthless on the GS — no early-Z to feed.
-- One change per hardware slot; a visual regression rejects it regardless of numbers.
-- Runtime raster offset wants a narrow DISPLAY write, not a full display-state
-  resend.
-- If exposing dither through ps2gl, route it through the drawenv object.
-- Multiple PSMT8 textures need per-texture CLUT ownership.
-- Manual GS mips work; keep `MIPTBP` per-texture and count locked mip slots
-  (`tiles × (levels − 1)`) against the small-slot pool before enabling them.
-- The GS fog unit is real and free: set `PRIM.FGE`, `PRMODECONT.AC`, `FOGCOL`,
-  and a per-vertex F in the kernel; mask the ADC word to bit 15 before OR-ing F.
-- GS fog interpolates in screen space — subdivide receding surfaces (rings,
-  segments) so F is sampled at real depths; do not switch F to a 1/W metric.
-- Drain the GS interrupt handler in a loop (service and clear every set CSR bit)
-  or a coincident SIGNAL+VSYNC eventually freezes the EE.
-- Zero a capability/requirements struct before field-init; an uninitialized
-  padding bitfield is a heap-layout-lottery crash.
-- Lit kernels discard per-vertex alpha (they use the material's) — animate alpha
-  through a kernel variant that loads the vertex `.w`, not through blend state.
-- Batch software-clipped output into DMA-visible arrays (double-buffered on frame
-  parity) and flush one array draw; per-vertex immediate calls lose to a slower CPU.
-- A 1-bit alpha key can be mipmapped if the filter matches the blend: coverage-
-  conserving for punch-through, energy-conserving (plain box) for additive.
-- Override `TEXA` per texture (`ta0 = 0`) for punch-through 16-bit tiles; the
-  fork's "identity" default (`ta0 = 0x80`) renders alpha-0 texels opaque.
-- A fork keeps the RAM texels pointer you pass to `glTexImage2D` and re-DMAs it —
-  transfer ownership explicitly, or deleting the texture leaks the buffer.
-- Prove a reload cycle leaks nothing by comparing RAM/VRAM against the running
-  minimum (drained floor), never the previous cycle (fragmentation is not a leak).
-- Fence every VU-mem store-to-load seam in VCL code (branch to next line) — vcl
-  does not model aliasing between pointer registers and hoists loads over stores.
-- Never `fmand` a new sign test under vcl (it "regenerates" flags with flag-inert
-  ABS); clamp a copy, `ftoi4`, `mtir`, mask bit 15.
-- Land pipeline Q in a register at the divide when it has more than one consumer;
-  a cycle-counted `mulq` pairing dies on the next regeneration.
-- vf00.w is ONE — never the additive base for a `.w` constant.
-- Terminate VU1 vertex loops overshoot-proof, never on pointer equality; ps2gl's
-  splitter can deliver 3n-1 verts to a triangle microcode.
-- Variable-output microcode: optimistic store + conditional commit + post-loop
-  giftag NLOOP patch; NLOOP=0 EOP=1 is a legal kick.
-- Prove custom-renderer selection by name (`pglGetCurRendererName`), not pixels.
-- Load both `libsd.irx` and `ps2snd.irx` for EE-side `sceSd*`.
-- `sceSdVoiceTrans` source is an IOP address; SPU destination is the byte
-  address value.
-- Encode SPU2 samples at 48 kHz; `PITCH 0x1000` is unity.
-- Loops use loop flags; one-shots use END only.
-- Music streaming belongs on the IOP in a custom IRX, not the EE render thread.
-- `mass0:` is BDM/iomanX, not legacy `mass:`.
-- Read IOP-DMA'd EE memory through the uncached mirror.
-- Burned data discs are illegal media on stock/FMCB consoles.
-- Measure before offloading: time the passes, then time inside `glDrawArrays`. The
-  gap between the two is the EE's per-vertex loops.
-- Vertices touched per frame is the currency — not triangles, not math per vertex.
-- The GS has no multitexturing. Two textures means two kicks; it does not mean two
-  transforms.
-- Constant colors entering a textured primitive scale by 128, not 255.
-- Moving clipping to VU1 removes the EE's free culling. Put a whole-triangle outcode
-  reject back, and give behind-near vertices only the near bit.
-- Cull small quads whole (particles, glows, billboards); never clip them. A radius
-  cull is not a visibility cull.
-- Display lists are install-once. They cannot back a streaming or tinted world.
-- A crash address is not a diagnosis: resolve `EPC` *and* `ra` with `addr2line`. A
-  small `BadVAddr` means a NULL base plus an offset.
-- Report performance averages over a time window, tagged with the configuration, and
-  reset the window when the configuration changes.
+- Treat EE, IOP, VU and GS addresses, caches and completion events as separate
+  contracts.
+- Standalone IOP bring-up and network-loader bring-up need different reset
+  policies; do not destroy services still owned by the loader.
+- Retain asynchronous RPC storage until the previous transaction is complete.
+  A timeout does not release it.
+- Keep game state and scene composition outside low-level backend helpers.
+- Give display registers one owner; do not layer independent display libraries.
+- Size framebuffer and Z reservations using their PSM page geometry. Validate
+  every color/Z pairing and scanout mode on hardware.
+- A 448-line progressive buffer can simplify page alignment; 480-line output
+  is also possible with a correctly padded reservation and display setup.
+- Match DISPLAY magnification to scan timing. Control BGCOLOR deliberately.
+- Vblank notification, rendering completion and scanout ownership are distinct.
+- Batch adjacent compatible draws without changing visible order.
+- Use stock and custom renderer paths only within their attribute/state contract.
+- A construction flush is not necessarily submission or hardware completion.
+- Publish DMA sources with the required cache operations, then keep them
+  immutable until all consumers retire. Buffer parity alone proves nothing.
+- Preserve the original triangle diagonal and clipping interpolation when
+  changing primitive representation.
+- Admit fast paths transactionally; never hide capacity failures by dropping
+  valid geometry.
+- Configure overlay depth explicitly. Equal world planes do not guarantee equal
+  raster depth; calculate decal tolerance in the active raster units.
+- Keep any temporary depth tolerance out of later scene depth unless that is
+  the intended ownership policy.
+- When bypassing library color conversion, use the GS scale appropriate to the
+  operation. Textured MODULATE identity is 128.
+- Alpha-zero blending can still re-dither RGB16. Color suppression must preserve
+  intended depth and destination-alpha behavior.
+- Keep UV magnitudes bounded and preserve perspective STQ through clipping.
+- Choose texture format and dimensions for the real resident budget. Track
+  compatible slot sizes and CLUT demand, not only total free pages.
+- Align each embedded DMA payload, not just the container's first symbol.
+- Store MIPTBP with its texture state; prove level residency and reconstruct
+  pyramids after a layout wipe.
+- Count legacy mip allocations or verify a shared packed owner's full address
+  layout, including CLUTs and teardown.
+- Preserve atlas isolation at every mip level. Address locality alone is not
+  a measured frame-time improvement.
+- Treat vertex opacity, fog and secondary-material strength as distinct meanings.
+- Set all fog-enabling state and submit the expected F coefficient. Account for
+  its screen-space interpolation when selecting geometry and the fog law.
+- Drain every handled GS interrupt source and acknowledge it correctly.
+- Initialize renderer-selection data completely and handle unsupported matches.
+- Check actual emitted packet counts, types and payload sizes.
+- Size VU staging from real transfers and prove worst-case clipped output.
+- Inspect scheduled VU instructions, relocation and memory budgets after changes.
+  Compiler barriers and hardware hazard fences are different.
+- Account for VCL's flag and alias-analysis limitations; do not assume a source
+  expression preserves the intended MAC flags or Q lifetime.
+- vf00.w is one; it is not the additive base for a zero-based w constant.
+- Make variable-output loops terminate safely and emit only well-formed GIF
+  packets, including deliberate empty completion tags.
+- Match texture pixel lifetime to the library's copy/borrow/ownership API.
+- Install immutable display lists once; keep dynamic material islands explicit.
+- Resolve crash addresses against the matching ELF before diagnosing them.
+- Allocator faults can expose earlier corruption. Padding that hides a fault
+  localizes layout sensitivity; it does not identify or repair the writer.
+- Compare reset-cycle memory at equivalent drained boundaries and state which
+  pools are measured.
+- Reserve SPU2 voices by role; identify reusable playback handles by generation.
+- At 48 kHz, SPU2 pitch 0x1000 is unity. Match encoding rate, block flags and
+  pitch policy.
+- Keep encoder chunk geometry, DMA transfers, ring halves and deployed files
+  consistent.
+- Avoid making rendering wait for music refill or diagnostic output.
+- Match filesystem paths to the loaded IOP driver stack; mass0: and legacy
+  mass: are different interfaces.
+- Test standalone boot separately from ps2link and test display/texture behavior
+  on real hardware as well as an emulator.
+- Attribute EE preparation, transfer/completion and presentation separately.
+- Collect the intended phase, record enabled scopes and inspect sampling buckets.
+- Missing telemetry is not zero work, and independent maxima are not one frame.
+- Preserve evidence for a specific implementation and workload; a successful
+  build, image, average or soak each establishes a different result.
 
-## Appendix B - Case Study: HyperSolar PS2 Port in One Page
+## Appendix B - Case Study: HyperSolar's PS2 Port
 
-The PS2 target started as a skeleton platform branch: a PS2 source set, a
-backend translation unit, no-op audio, placeholder rendering, and enough input
-to cycle states end-to-end.
+HyperSolar is an on-rails shooter used here as an example, not as a reference
+architecture every PS2 game should copy. Its port illustrates how ordinary
+rendering features expose the hardware boundaries discussed in this book.
 
-Milestone 1 brought up the Ninja Dynamics splash using embedded PNG data,
-GS-alpha-correct texture upload, and the eye-space raw GL perspective-quad path.
+The initial port combined shared scene logic with a small PS2 backend.
+Embedded images, GS-scaled alpha and perspective textured quads brought up
+the title scenes. Static models used display lists; rapidly changing effects
+used explicit draw helpers. This separated immutable geometry from live
+material parameters without duplicating gameplay on the new platform.
 
-Milestones 2 and 3 folded the PS2 PoC environment into shared title rendering:
-skybox, floor, sun, haze, speedlines, lens flare, logo display list, shared font
-atlas, and PS2-safe texture/filter handling.
+HUD rendering exposed the cost of repeated state setup. Grouping text and
+rectangles reduced it, while later colored-array paths required careful
+preservation of triangle diagonals, logical order and deferred source lifetime.
+The lesson was to batch compatible work, not to sort all UI by texture.
 
-Enemy and player models use display lists with cached AABB data, explicit
-texture lifetime handling, and PS2-specific clipping/culling state.
+Dense city rendering exposed different bottlenecks. Texture residency required
+per-texture CLUT and mip state, with format-specific packed owners where useful.
+VU clipping needed complete output-capacity bounds. Reusing wall transforms
+for two materials reduced preparation, but each material still needed its
+own blend, fog and depth semantics.
 
-HUD performance moved from per-glyph/per-rect reconfiguration toward grouped
-font and rect batches, proving state changes were the dominant cost.
+Several apparent rendering defects were ownership defects. An overwritten
+scratch region damaged an earlier queued draw. A drifting retained origin
+lost precision despite bounded player coordinates. An aligned inner asset
+section faulted because its outer container offset was odd. Each repair
+strengthened a contract rather than depending on slower code or a lucky
+memory layout.
 
-Texture work evolved from oversized RGBA/16-bit experiments to a full PSMT8 CSV
-pipeline with per-asset settings, CLUT ownership fixes, 16-byte blob alignment,
-manual mips for floors, dithered quantization, and stage-resident loading.
+Audio demonstrated the same principle across processors: voices required
+playback identity, encoded files had to match the IOP ring geometry, and
+asynchronous command admission had to be distinguished from execution.
+Memory-card persistence and network-loader behavior needed separate tests.
 
-Progressive video became a real 640x448p GS layout switch with 16-bit color/Z,
-drawenv dithering, shared screen dimensions, and a black-bracketed transition.
-
-Audio came up in layers: pitch-clean SPU2 loops, shared mix math, one-shot voice
-pool, custom ADPCM encoder, then music streaming through a custom IOP IRX and
-BDM `mass0:` storage.
-
-Saves reached PS2 memory cards with screen settings, aligned libmc buffers,
-ps2link fileio barrier, BIOS browser icons, and a `glb2icn` converter.
-
-A dense-city stage then pushed the fork past its comfort zone and produced the
-Chapter 19-21 material in one sustained run. GS hardware fog was wired into the
-vertex kernel and debugged from a red-`FOGCOL` probe through a context-stomp pad
-fix; the ground was re-tessellated into radial rings so screen-space fog samples
-at real depth. An intermittent whole-machine freeze was traced to a
-single-event GS interrupt handler and fixed with a drain loop, using a latching
-BGCOLOR watchdog that names the wedge. Mipmaps moved from a single global owner
-to per-texture `MIPTBP` packets so the city's tiles could all mip at once, which
-in turn exposed the locked-mip slot budget. Per-vertex alpha, silently discarded
-by the lit kernel, got its own kernel variant so building fades could work at
-all. Finally a debug "reset the whole game" path became a memory-conservation
-proof: a per-cycle RAM/VRAM instrument judged against the drained floor drove the
-leak count to zero, the largest leak being a fork that kept — but never freed —
-the DMA texels pointer handed to `glTexImage2D`.
-
-The clipper's own endgame followed (Chapter 22), and then the lesson that outranks
-it (Chapter 23): before offloading more work, measure which side of the pipeline is
-starving. A counter around `glDrawArrays` proved the city was bound by per-vertex
-memory traffic on the EE, not by clip arithmetic — which killed two plausible
-optimizations before they were finished, and pointed at the one that worked: draw
-the shared wall geometry once and kick the GS twice.
-
-The final rule of the port is simple: the shared game owns meaning, timing,
-assets, and scene order; the PS2 backend owns the hardware-safe way to draw,
-store, stream, and persist those decisions.
+These examples share a method: identify the producer and consumer, preserve
+the meaning and lifetime of their data, and measure the boundary actually
+being changed. Their particular scene layout, asset settings and performance
+results are not universal PS2 requirements.
