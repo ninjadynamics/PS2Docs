@@ -47,17 +47,21 @@ The PS2 technical reference manuals (SCE Confidential, archived). The **GS User'
 Manual** is the one you'll open most; the **EE Overview** is the closest thing to
 a "system architecture" tour — start there.
 
-| Manual | Pages | Covers |
-|---|---:|---|
-| [GS_Users_Manual.pdf](GS_Users_Manual.pdf) | 177 | **Graphics Synthesizer** — registers, pixel-storage modes (PSMCT32/16/8/4, CLUT), `TEXFLUSH`, blending/alpha, scissor, GIF packet formats, display environment |
-| [GS_Users_Manual_Supplement.pdf](GS_Users_Manual_Supplement.pdf) | 22 | GS errata / additions |
-| [EE_Overview_Manual.pdf](EE_Overview_Manual.pdf) | 65 | **System architecture** — EE core + VU0/VU1 + GIF + VIF + DMAC + IPU and how they connect |
-| [EE_Users_Manual.pdf](EE_Users_Manual.pdf) | 219 | EE peripherals — DMAC, GIF, VIF, timers, INTC, scratchpad |
-| [EE_Core_Users_Manual.pdf](EE_Core_Users_Manual.pdf) | 181 | The R5900 CPU core (pipeline, caches, MMU, COP0) |
-| [EE_Core_Instruction_Set_Manual.pdf](EE_Core_Instruction_Set_Manual.pdf) | 409 | R5900 + MMI (multimedia) instruction set |
-| [VU_Users_Manual.pdf](VU_Users_Manual.pdf) | 369 | VU0/VU1 architecture (registers, pipelines, micro mode) |
-| [vu-instruction-manual.pdf](vu-instruction-manual.pdf) | 129 | VU micro-instruction set |
-| [SPU2_Overview_Manual.pdf](SPU2_Overview_Manual.pdf) | 80 | **SPU2 sound processor** — 2 cores × 24 ADPCM voices @ 48 kHz, 2 MB local RAM; PITCH/VOLL/VOLR/ADSR/KON, mixing, reverb |
+Each manual also has a machine-converted **Markdown** copy in [`markdown/`](markdown/)
+for grepping and feeding to tools. It is a text extraction, so tables come through
+as HTML and figures are missing; check the PDF when a page matters.
+
+| Manual | Text | Pages | Covers |
+|---|---|---:|---|
+| [GS_Users_Manual.pdf](GS_Users_Manual.pdf) | [Markdown](markdown/GS_Users_Manual.md) | 177 | **Graphics Synthesizer** — registers, pixel-storage modes (PSMCT32/16/8/4, CLUT), `TEXFLUSH`, blending/alpha, scissor, GIF packet formats, display environment |
+| [GS_Users_Manual_Supplement.pdf](GS_Users_Manual_Supplement.pdf) | [Markdown](markdown/GS_Users_Manual_Supplement.md) | 22 | GS errata / additions |
+| [EE_Overview_Manual.pdf](EE_Overview_Manual.pdf) | [Markdown](markdown/EE_Overview_Manual.md) | 65 | **System architecture** — EE core + VU0/VU1 + GIF + VIF + DMAC + IPU and how they connect |
+| [EE_Users_Manual.pdf](EE_Users_Manual.pdf) | [Markdown](markdown/EE_Users_Manual.md) | 219 | EE peripherals — DMAC, GIF, VIF, timers, INTC, scratchpad |
+| [EE_Core_Users_Manual.pdf](EE_Core_Users_Manual.pdf) | [Markdown](markdown/EE_Core_Users_Manual.md) | 181 | The R5900 CPU core (pipeline, caches, MMU, COP0) |
+| [EE_Core_Instruction_Set_Manual.pdf](EE_Core_Instruction_Set_Manual.pdf) | [Markdown](markdown/EE_Core_Instruction_Set_Manual.md) | 409 | R5900 + MMI (multimedia) instruction set |
+| [VU_Users_Manual.pdf](VU_Users_Manual.pdf) | [Markdown](markdown/VU_Users_Manual.md) | 369 | VU0/VU1 architecture (registers, pipelines, micro mode) |
+| [vu-instruction-manual.pdf](vu-instruction-manual.pdf) | [Markdown](markdown/vu-instruction-manual.md) | 129 | VU micro-instruction set |
+| [SPU2_Overview_Manual.pdf](SPU2_Overview_Manual.pdf) | [Markdown](markdown/SPU2_Overview_Manual.md) | 80 | **SPU2 sound processor** — 2 cores × 24 ADPCM voices @ 48 kHz, 2 MB local RAM; PITCH/VOLL/VOLR/ADSR/KON, mixing, reverb |
 
 ---
 
