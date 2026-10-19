@@ -6,15 +6,15 @@ Official Sony PlayStation 2 developer manuals (SCE Confidential, leaked/archived
 
 | File | Covers | Most relevant for |
 |---|---|---|
-| `GS_Users_Manual.pdf` (177p) | **Graphics Synthesizer** — registers, texture formats (PSMCT32/16/8/4, CLUT), `TEXFLUSH`, blending/alpha, scissor, the GIF packet formats (PACKED/REGLIST/IMAGE), display environment | textures, blending, GS-OOM, the AR/display setup — the core graphics reference |
-| `GS_Users_Manual_Supplement.pdf` (22p) | GS errata / additions to the above | corner cases |
-| `EE_Overview_Manual.pdf` (65p) | **System architecture**: EE core + VU0/VU1 + GIF + VIF + DMAC + IPU and how they connect | the big picture; start here |
-| `EE_Users_Manual.pdf` (219p) | EE peripherals — **DMAC, GIF, VIF, timers, INTC**, scratchpad | DMA paths, ps2gl/VIF interaction, GS-OOM |
-| `EE_Core_Users_Manual.pdf` (181p) | The R5900 CPU core (pipeline, caches, MMU, COP0) | CPU-side perf |
-| `EE_Core_Instruction_Set_Manual.pdf` (409p) | R5900 + MMI (multimedia) instruction set | hand-tuning / intrinsics |
-| `VU_Users_Manual.pdf` (369p) | VU0/VU1 architecture (registers, pipelines, microMode). **Ch 3.3.5** (per-instruction flag table — ABS/MAX/MINI/FTOI/MOVE set NO flags) and **Ch 3.4** (hazards: Q/ACC/I have no interlocks; `waitq` stalls both pipes; same-pair semantics) arbitrated the VU1 clip renderer's vcl bugs | geometry / the clippers (EE software + VU1 microcode) |
-| `vu-instruction-manual.pdf` (129p) | VU micro-instruction set (per-instruction latency/flag detail) | VU microcode |
-| `SPU2_Overview_Manual.pdf` (80p) | **SPU2 sound processor** — 2 cores × 24 ADPCM voices @ 48 kHz, 2 MB local RAM; voice PITCH/VOLL/VOLR/ADSR/KON registers, the pitch math (`0x1000` = native @ 48 kHz, range −12..+2 oct), mixing, reverb | PS2 audio backend (`audio.c`/`playstation2.c` `ps2_audio_*`), see [`PS2/plans/done/AUDIO_PLAN.md`](../../../PS2/plans/done/AUDIO_PLAN.md) |
+| `GS_Users_Manual.pdf` · [md](markdown/GS_Users_Manual.md) (177p) | **Graphics Synthesizer** — registers, texture formats (PSMCT32/16/8/4, CLUT), `TEXFLUSH`, blending/alpha, scissor, the GIF packet formats (PACKED/REGLIST/IMAGE), display environment | textures, blending, GS-OOM, the AR/display setup — the core graphics reference |
+| `GS_Users_Manual_Supplement.pdf` · [md](markdown/GS_Users_Manual_Supplement.md) (22p) | GS errata / additions to the above | corner cases |
+| `EE_Overview_Manual.pdf` · [md](markdown/EE_Overview_Manual.md) (65p) | **System architecture**: EE core + VU0/VU1 + GIF + VIF + DMAC + IPU and how they connect | the big picture; start here |
+| `EE_Users_Manual.pdf` · [md](markdown/EE_Users_Manual.md) (219p) | EE peripherals — **DMAC, GIF, VIF, timers, INTC**, scratchpad | DMA paths, ps2gl/VIF interaction, GS-OOM |
+| `EE_Core_Users_Manual.pdf` · [md](markdown/EE_Core_Users_Manual.md) (181p) | The R5900 CPU core (pipeline, caches, MMU, COP0) | CPU-side perf |
+| `EE_Core_Instruction_Set_Manual.pdf` · [md](markdown/EE_Core_Instruction_Set_Manual.md) (409p) | R5900 + MMI (multimedia) instruction set | hand-tuning / intrinsics |
+| `VU_Users_Manual.pdf` · [md](markdown/VU_Users_Manual.md) (369p) | VU0/VU1 architecture (registers, pipelines, microMode). **Ch 3.3.5** (per-instruction flag table — ABS/MAX/MINI/FTOI/MOVE set NO flags) and **Ch 3.4** (hazards: Q/ACC/I have no interlocks; `waitq` stalls both pipes; same-pair semantics) arbitrated the VU1 clip renderer's vcl bugs | geometry / the clippers (EE software + VU1 microcode) |
+| `vu-instruction-manual.pdf` · [md](markdown/vu-instruction-manual.md) (129p) | VU micro-instruction set (per-instruction latency/flag detail) | VU microcode |
+| `SPU2_Overview_Manual.pdf` · [md](markdown/SPU2_Overview_Manual.md) (80p) | **SPU2 sound processor** — 2 cores × 24 ADPCM voices @ 48 kHz, 2 MB local RAM; voice PITCH/VOLL/VOLR/ADSR/KON registers, the pitch math (`0x1000` = native @ 48 kHz, range −12..+2 oct), mixing, reverb | PS2 audio backend (`audio.c`/`playstation2.c` `ps2_audio_*`), see [`PS2/plans/done/AUDIO_PLAN.md`](../../../PS2/plans/done/AUDIO_PLAN.md) |
 
 ## Notes
 
